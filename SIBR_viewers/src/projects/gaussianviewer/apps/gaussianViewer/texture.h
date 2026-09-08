@@ -145,10 +145,17 @@ public:
             return { rc * x - rs * y + 0.5f, rs * x + rc * y + 0.5f };
         };
 
+        // Mirror the colour content along U before it becomes a decal.
+        // The ExpMap tangent frame is right-handed (U = seed x-axis, V = n x U),
+        // so mapping image column -> +U lands the pattern on the model's front
+        // face as a left-right mirror of the source file. Reversing the column
+        // here undoes it. The coverage mask below is rasterized from the
+        // (unreversed) ExpMap UVs and still clips to the true patch outline;
+        // renderCUDA samples this texture at those same UVs.
         sibr::ImageRGBA maskedImage(W, H);
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
-                maskedImage(x, y) = _originalImage(x, y);
+                maskedImage(x, y) = _originalImage(W - 1 - x, y);
             }
         }
 
