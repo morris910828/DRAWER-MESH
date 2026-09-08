@@ -1,7 +1,7 @@
-data_name="cs_kitchen"
-data_dir=/home/hongchix/data/${data_name}
-image_dir="images_2"
-downscale_factor=2
+data_name="armadillo1"
+data_dir=/workspace/DRAWER/data/${data_name}
+image_dir="renders"
+downscale_factor=1
 
 # monocular depth and normal
 
@@ -28,15 +28,15 @@ ln -s ${data_dir}/marigold_ft/normal ${data_dir}/normal
 # sdf reconstruction
 cd ../sdf
 
-python scripts/train.py bakedsdf --vis wandb \
+python scripts/train.py bakedsdf --vis tensorboard \
     --output-dir outputs/${data_name} --experiment-name ${data_name}_sdf_recon \
-    --trainer.steps-per-eval-image 2000 --trainer.steps-per-eval-all-images 250001 \
-    --trainer.max-num-iterations 250001 --trainer.steps-per-eval-batch 250001 \
-    --optimizers.fields.scheduler.max-steps 250000 \
-    --optimizers.field-background.scheduler.max-steps 250000 \
-    --optimizers.proposal-networks.scheduler.max-steps 250000 \
-    --pipeline.model.eikonal-anneal-max-num-iters 250000 \
-    --pipeline.model.beta-anneal-max-num-iters 250000 \
+    --trainer.steps-per-eval-image 2000 --trainer.steps-per-eval-all-images 50001 \
+    --trainer.max-num-iterations 50001 --trainer.steps-per-eval-batch 50001 \
+    --optimizers.fields.scheduler.max-steps 50000 \
+    --optimizers.field-background.scheduler.max-steps 50000 \
+    --optimizers.proposal-networks.scheduler.max-steps 50000 \
+    --pipeline.model.eikonal-anneal-max-num-iters 50000 \
+    --pipeline.model.beta-anneal-max-num-iters 50000 \
     --pipeline.model.sdf-field.bias 1.5 --pipeline.model.sdf-field.inside-outside True \
     --pipeline.model.eikonal-loss-mult 0.01 --pipeline.model.num-neus-samples-per-ray 24 \
     --pipeline.datamanager.train-num-rays-per-batch 4096 \
@@ -52,7 +52,7 @@ python scripts/train.py bakedsdf --vis wandb \
     --mono_depth_data True \
     --panoptic_segment False \
     --downscale_factor ${downscale_factor} \
-    --num_max_image 2000 # only use if memory is not enough
+    --num_max_image 200
 
 sdf_dir=outputs/${data_name}/${data_name}_sdf_recon
 

@@ -319,6 +319,7 @@ class Panoptic(DataParser):
         meta = load_from_json(self.config.data / "transforms.json")
         image_filenames = []
         mask_filenames = []
+        num_missing_masks = 0
         poses = []
         num_skipped_image_filenames = 0
 
@@ -401,7 +402,14 @@ class Panoptic(DataParser):
             if "mask_path" in frame:
                 mask_filepath = PurePath(frame["mask_path"])
                 mask_fname = self._get_fname(mask_filepath, downsample_folder_prefix="masks_")
-                mask_filenames.append(mask_fname)
+                # Existence checked here, unlike before: a mask_path that does not resolve
+                # used to be appended anyway and then silently dropped downstream (see the
+                # DataparserOutputs call below), so a whole dataset could train unmasked
+                # with nothing said. Counting the misses lets the warning below be specific.
+                if mask_fname.exists():
+                    mask_filenames.append(mask_fname)
+                else:
+                    num_missing_masks += 1
 
             # if self.config.mono_depth_data:
             #     dpath = fname.parent.parent / "depth" / (os.path.splitext(fname.name)[0] + ".npy")
@@ -453,6 +461,25 @@ class Panoptic(DataParser):
         No image files found. 
         You should check the file_paths in the transforms.json file to make sure they are correct.
         """
+        if num_missing_masks:
+            # Hard error, not a warn-and-continue: transforms.json naming a mask_path per
+            # frame means masking is intended, and a mesh-anchored splat trained unmasked
+            # collapses (measured on table_gs18: eval PSNR 19.47 dB inside the mask ->
+            # 11.64 dB over the full frame; reproduced on table_gs24 at downscale 1, which
+            # silently ran unmasked because only masks_4/ had been generated -- eval PSNR
+            # ~11 dB, visibly blurry). Failing loudly here beats burning a multi-hour run
+            # on a config mistake. A genuinely unmasked dataset simply omits mask_path.
+            expected_dir = self._get_fname(
+                PurePath(meta["frames"][0]["mask_path"]), downsample_folder_prefix="masks_"
+            ).parent
+            raise RuntimeError(
+                f"{num_missing_masks}/{len(image_filenames)} mask file(s) named in "
+                f"transforms.json do not exist for downscale factor {self.downscale_factor}. "
+                f"Expected them under: {expected_dir}\n"
+                f"Generate the masks at this resolution (or point downscale_factor at a "
+                f"resolution whose masks_<factor>/ folder exists), or remove mask_path from "
+                f"transforms.json to train unmasked on purpose."
+            )
         assert len(mask_filenames) == 0 or (
             len(mask_filenames) == len(image_filenames)
         ), """
@@ -748,6 +775,11 @@ class Panoptic(DataParser):
             metadata=metadata,
             dataparser_scale=scale_factor,
             dataparser_transform=transform_matrix,
+            # THE actual bug: this argument was missing, so DataparserOutputs took its
+            # None default and base_dataset's `if mask_filenames is not None` never fired.
+            # Every mask this parser resolved was computed and then thrown away, and no
+            # run in this project has ever trained masked.
+            mask_filenames=mask_filenames if len(mask_filenames) > 0 else None,
         )
         return dataparser_outputs
 
@@ -863,7 +895,12 @@ class Panoptic(DataParser):
             pix_to_face=torch.arange(N_Gaussians).reshape(1, 1, N_Gaussians, 1),
             bary_coords=(torch.ones(1, 1, N_Gaussians, 1, 3) / 3)
         )
-        features_dc = mesh.textures.sample_textures(mesh_fragments).reshape(N_Gaussians, 3)
+        if mesh.textures is not None:
+            features_dc = mesh.textures.sample_textures(mesh_fragments).reshape(N_Gaussians, 3)
+        else:
+            # 沒有 mtl/texture 時使用預設顏色
+            default_color = torch.tensor([80/255, 40/255, 10/255], dtype=torch.float32)
+            features_dc = default_color.unsqueeze(0).expand(N_Gaussians, -1).clone()
 
         normals = mesh.faces_normals_packed().clone().reshape(-1, 3)
 

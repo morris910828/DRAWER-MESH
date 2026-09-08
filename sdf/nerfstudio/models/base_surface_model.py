@@ -118,7 +118,7 @@ class SurfaceModelConfig(ModelConfig):
     """S3IM repeat time."""
     s3im_patch_height: int = 32
     """S3IM virtual patch height."""
-    sdf_field: SDFFieldConfig = SDFFieldConfig()
+    sdf_field: SDFFieldConfig = field(default_factory=SDFFieldConfig)
     """Config for SDF Field"""
     background_model: Literal["grid", "mlp", "none"] = "mlp"
     """background models"""
@@ -404,7 +404,10 @@ class SurfaceModel(Model):
         if self.training:
             # eikonal loss
             grad_theta = outputs["eik_grad"]
-            loss_dict["eikonal_loss"] = ((grad_theta.norm(2, dim=-1) - 1) ** 2).mean() * self.config.eikonal_loss_mult
+            # epsilon-guarded norm: torch.norm() backpropagates NaN where grad == 0
+            # exactly (see the same guard in bakedsdf.py).
+            grad_norm = torch.sqrt(torch.sum(grad_theta**2, dim=-1) + 1e-12)
+            loss_dict["eikonal_loss"] = ((grad_norm - 1) ** 2).mean() * self.config.eikonal_loss_mult
             # s3im loss
             if self.config.s3im_loss_mult > 0:
                 loss_dict["s3im_loss"] = self.s3im_loss(image, outputs["rgb"]) * self.config.s3im_loss_mult
@@ -538,9 +541,10 @@ class SurfaceModel(Model):
         image = torch.moveaxis(image, -1, 0)[None, ...]
         rgb = torch.moveaxis(rgb, -1, 0)[None, ...]
 
-        psnr = self.psnr(image, rgb)
-        ssim = self.ssim(image, rgb)
-        lpips = self.lpips(image, rgb)
+        rgb_clean = rgb.nan_to_num(nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        psnr = self.psnr(image, rgb_clean)
+        ssim = self.ssim(image, rgb_clean)
+        lpips = self.lpips(image, rgb_clean)
 
         # all of these metrics will be logged as scalars
         metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore

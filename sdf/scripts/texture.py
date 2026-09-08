@@ -64,7 +64,7 @@ class TextureMesh:
             # mesh_list = []
             for input_mesh_filename in self.input_mesh_filename:
                 mesh = trimesh.exchange.load.load_mesh(input_mesh_filename)
-                if mesh.faces.shape[0] > self.target_num_faces:
+                if self.target_num_faces is not None and mesh.faces.shape[0] > self.target_num_faces:
                     target_num_faces = self.target_num_faces
                 else:
                     target_num_faces = None
@@ -98,7 +98,7 @@ class TextureMesh:
         else:
             # load the Mesh
             mesh = trimesh.exchange.load.load_mesh(self.input_mesh_filename)
-            if mesh.faces.shape[0] > self.target_num_faces:
+            if self.target_num_faces is not None and mesh.faces.shape[0] > self.target_num_faces:
                 target_num_faces = self.target_num_faces
             else:
                 target_num_faces = None

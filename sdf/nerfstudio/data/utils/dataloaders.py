@@ -118,7 +118,10 @@ class CacheDataloader(DataLoader):
         """Returns a collated batch."""
         batch_list = self._get_batch_list()
         collated_batch = self.collate_fn(batch_list)
-        collated_batch = get_dict_to_torch(collated_batch, device=self.device, exclude=["image"])
+        # Cache on CPU: pixel_sampler already uses image.device (CPU) for sampling,
+        # and base_surface_model explicitly calls .to(self.device) on each batch value.
+        # GPU-caching large tensors like mask would OOM with large datasets.
+        collated_batch = get_dict_to_torch(collated_batch, device="cpu", exclude=["image"])
         return collated_batch
 
     def __iter__(self):

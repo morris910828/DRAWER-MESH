@@ -250,22 +250,7 @@ class Trainer:
                     time.sleep(0.01)
                 with self.train_lock:
                     with TimeWriter(writer, EventName.ITER_TRAIN_TIME, step=step) as train_t:
-                        self.pipeline.train()
-
-                        # training callbacks before the training iteration
-                        for callback in self.callbacks:
-                            callback.run_callback_at_location(
-                                step, location=TrainingCallbackLocation.BEFORE_TRAIN_ITERATION
-                            )
-
-                        # time the forward pass
-                        loss, loss_dict, metrics_dict = self.train_iteration(step)
-
-                        # training callbacks after the training iteration
-                        for callback in self.callbacks:
-                            callback.run_callback_at_location(
-                                step, location=TrainingCallbackLocation.AFTER_TRAIN_ITERATION
-                            )
+                        loss, loss_dict, metrics_dict = self._run_train_step_with_oom_retry(step)
 
                 # Skip the first two steps to avoid skewed timings that break the viewer rendering speed estimate.
                 if step > 1:
@@ -477,6 +462,50 @@ class Trainer:
             for f in self.checkpoint_dir.glob("*"):
                 if f != ckpt_path:
                     f.unlink()
+
+    def _run_train_step_with_oom_retry(self, step: int, retry_wait_sec: float = 10.0) -> TRAIN_INTERATION_OUTPUT:
+        """
+        Run one training step (pre/post-iteration callbacks + train_iteration),
+        retrying with a wait-and-clear-cache backoff on CUDA OOM instead of crashing
+        the whole run. Added 2026-08-02 at the user's request: this GPU is sometimes
+        shared with other, unrelated processes, so a transient OOM here isn't
+        necessarily this run's fault and often resolves itself once the other process
+        frees memory -- no need to lose the whole run and restart from the last
+        checkpoint over what might be a temporary spike.
+
+        Safe to retry the whole step: train_iteration() calls zero_grad_some() at its
+        very start every time, and no parameter update happens until its last few
+        lines (optimizer_scaler_step_some) -- an OOM anywhere before that leaves model
+        parameters exactly as they were before this attempt, so retrying just redoes
+        forward/backward cleanly, nothing to roll back. Same reasoning covers the
+        BEFORE/AFTER_TRAIN_ITERATION callbacks (density control etc.): they only ever
+        run after this step's train_iteration has already returned successfully, so an
+        OOM inside one of them can't have left train_iteration's own state half-done.
+
+        Retries indefinitely (no attempt cap) with a fixed wait -- this is meant for a
+        human-supervised long training run where "eventually resolves or the user
+        notices and intervenes" is preferable to "silently give up after N tries and
+        crash unattended." Re-raises immediately for any RuntimeError that isn't an
+        out-of-memory error; only OOM is treated as retryable.
+        """
+        while True:
+            try:
+                self.pipeline.train()
+                for callback in self.callbacks:
+                    callback.run_callback_at_location(step, location=TrainingCallbackLocation.BEFORE_TRAIN_ITERATION)
+                result = self.train_iteration(step)
+                for callback in self.callbacks:
+                    callback.run_callback_at_location(step, location=TrainingCallbackLocation.AFTER_TRAIN_ITERATION)
+                return result
+            except RuntimeError as e:
+                if "out of memory" not in str(e).lower():
+                    raise
+                CONSOLE.print(
+                    f"[bold red]CUDA OOM at step {step} -- clearing cache, waiting "
+                    f"{retry_wait_sec:.0f}s, then retrying this step (not crashing the run).[/bold red]"
+                )
+                torch.cuda.empty_cache()
+                time.sleep(retry_wait_sec)
 
     @profiler.time_function
     def train_iteration(self, step: int) -> TRAIN_INTERATION_OUTPUT:

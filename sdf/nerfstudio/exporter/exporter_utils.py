@@ -91,7 +91,7 @@ def remesh(mesh):
     ms = pymeshlab.MeshSet()
     ms.add_mesh(pml_mesh, 'mesh')
 
-    ms.apply_filter('meshing_isotropic_explicit_remeshing', targetlen=pymeshlab.AbsoluteValue(mean_edge_len))
+    ms.apply_filter('meshing_isotropic_explicit_remeshing', targetlen=pymeshlab.PureValue(mean_edge_len))
 
     m = ms.current_mesh()
 
@@ -108,7 +108,7 @@ def get_mesh_from_filename(filename: str, target_num_faces: Optional[int] = None
     ms.load_new_mesh(filename)
     if target_num_faces is not None:
         CONSOLE.print("Running meshing decimation with quadric edge collapse")
-        ms.simplification_quadric_edge_collapse_decimation(targetfacenum=target_num_faces)
+        ms.meshing_decimation_quadric_edge_collapse(targetfacenum=target_num_faces)
     mesh = ms.current_mesh()
 
     print("remesh..")

@@ -494,9 +494,12 @@ class ExportGaussianSplat(Exporter):
         filename: str,
         count: int,
         map_to_tensors: typing.OrderedDict[str, np.ndarray],
+        mesh_verts: Optional[np.ndarray] = None,
+        mesh_faces: Optional[np.ndarray] = None,
     ):
         """
         Writes a PLY file with given vertex properties and a tensor of float or uint8 values in the order specified by the OrderedDict.
+        Optionally appends mesh vertices (element mesh_vertex) and mesh faces (element mesh_face).
         Note: All float values will be converted to float32 for writing.
 
         Parameters:
@@ -504,20 +507,22 @@ class ExportGaussianSplat(Exporter):
         count (int): The number of vertices to write.
         map_to_tensors (OrderedDict[str, np.ndarray]): An ordered dictionary mapping property names to numpy arrays of float or uint8 values.
             Each array should be 1-dimensional and of equal length matching 'count'. Arrays should not be empty.
+        mesh_verts (np.ndarray, optional): shape (V, 3) float32 mesh vertex positions.
+        mesh_faces (np.ndarray, optional): shape (F, 3) int32 mesh face vertex indices.
         """
 
         # Ensure count matches the length of all tensors
         if not all(len(tensor) == count for tensor in map_to_tensors.values()):
             raise ValueError("Count does not match the length of all tensors")
 
-        # Type check for numpy arrays of type float or uint8 and non-empty
+        # Type check for numpy arrays of type float, uint8, or int32 and non-empty
         if not all(
             isinstance(tensor, np.ndarray)
-            and (tensor.dtype.kind == "f" or tensor.dtype == np.uint8)
+            and (tensor.dtype.kind == "f" or tensor.dtype == np.uint8 or tensor.dtype == np.int32)
             and tensor.size > 0
             for tensor in map_to_tensors.values()
         ):
-            raise ValueError("All tensors must be numpy arrays of float or uint8 type and not empty")
+            raise ValueError("All tensors must be numpy arrays of float, uint8, or int32 type and not empty")
 
         with open(filename, "wb") as ply_file:
             # Write PLY header
@@ -528,20 +533,47 @@ class ExportGaussianSplat(Exporter):
 
             # Write properties, in order due to OrderedDict
             for key, tensor in map_to_tensors.items():
-                data_type = "float" if tensor.dtype.kind == "f" else "uchar"
+                if tensor.dtype.kind == "f":
+                    data_type = "float"
+                elif tensor.dtype == np.int32:
+                    data_type = "int"
+                else:
+                    data_type = "uchar"
                 ply_file.write(f"property {data_type} {key}\n".encode())
+
+            if mesh_verts is not None:
+                ply_file.write(f"element mesh_vertex {mesh_verts.shape[0]}\n".encode())
+                ply_file.write(b"property float x\n")
+                ply_file.write(b"property float y\n")
+                ply_file.write(b"property float z\n")
+
+            if mesh_faces is not None:
+                ply_file.write(f"element mesh_face {mesh_faces.shape[0]}\n".encode())
+                ply_file.write(b"property list uchar int vertex_indices\n")
 
             ply_file.write(b"end_header\n")
 
-            # Write binary data
-            # Note: If this is a performance bottleneck consider using numpy.hstack for efficiency improvement
+            # Write Gaussian vertex data
             for i in range(count):
                 for tensor in map_to_tensors.values():
                     value = tensor[i]
                     if tensor.dtype.kind == "f":
                         ply_file.write(np.float32(value).tobytes())
+                    elif tensor.dtype == np.int32:
+                        ply_file.write(np.int32(value).tobytes())
                     elif tensor.dtype == np.uint8:
                         ply_file.write(value.tobytes())
+
+            # Write mesh vertices
+            if mesh_verts is not None:
+                ply_file.write(mesh_verts.astype(np.float32).tobytes())
+
+            # Write mesh faces (each face: 1 byte count=3, then 3 int32 indices)
+            if mesh_faces is not None:
+                faces_int32 = mesh_faces.astype(np.int32)
+                for face in faces_int32:
+                    ply_file.write(np.uint8(3).tobytes())
+                    ply_file.write(face.tobytes())
 
     def main(self) -> None:
         if not self.output_dir.exists():
@@ -559,15 +591,34 @@ class ExportGaussianSplat(Exporter):
         map_to_tensors = OrderedDict()
 
         with torch.no_grad():
+            # Capture scales/opacities BEFORE finalize_face_assignment() below: their
+            # clamp bounds key off gaussians_to_mesh_indices, so reading them after
+            # relabeling would reclamp an already-trained Gaussian to a new face's
+            # (possibly smaller) bound for no reason other than the relabel itself.
+            # See splatfacto_on_mesh_uc.py's export_splatfacto_on_mesh() for the same
+            # discipline.
+            scales = model.scales.data.cpu().numpy()
+            opacities = model.opacities.data.cpu().numpy()
+
+            if hasattr(model, "finalize_face_assignment"):
+                model.finalize_face_assignment()
+
             positions = model.means.cpu().numpy()
             count = positions.shape[0]
             n = count
+            CONSOLE.print(f"Exporting {count} Gaussian splats")
             map_to_tensors["x"] = positions[:, 0]
             map_to_tensors["y"] = positions[:, 1]
             map_to_tensors["z"] = positions[:, 2]
-            map_to_tensors["nx"] = np.zeros(n, dtype=np.float32)
-            map_to_tensors["ny"] = np.zeros(n, dtype=np.float32)
-            map_to_tensors["nz"] = np.zeros(n, dtype=np.float32)
+            if hasattr(model, "normals") and hasattr(model, "gaussians_to_mesh_indices"):
+                normals_np = model.normals[model.gaussians_to_mesh_indices].cpu().numpy().astype(np.float32)
+                map_to_tensors["nx"] = normals_np[:, 0]
+                map_to_tensors["ny"] = normals_np[:, 1]
+                map_to_tensors["nz"] = normals_np[:, 2]
+            else:
+                map_to_tensors["nx"] = np.zeros(n, dtype=np.float32)
+                map_to_tensors["ny"] = np.zeros(n, dtype=np.float32)
+                map_to_tensors["nz"] = np.zeros(n, dtype=np.float32)
 
             if model.config.sh_degree > 0:
                 shs_0 = model.shs_0.contiguous().cpu().numpy()
@@ -583,9 +634,15 @@ class ExportGaussianSplat(Exporter):
                 colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
                 map_to_tensors["colors"] = (colors * 255).astype(np.uint8)
 
-            map_to_tensors["opacity"] = model.opacities.data.cpu().numpy()
+            map_to_tensors["opacity"] = opacities
 
-            scales = model.scales.data.cpu().numpy()
+            # Clamp log-scale: degenerate triangles (nearly collinear verts) have
+            # circumradius → ∞, which lets scale_limit = upper_scale * xyz_radius
+            # reach 1e8+, crashing the viewer's CUDA rasterizer.
+            # Cap at 3× the 99th-percentile face radius to preserve all normal faces.
+            _r99 = float(np.percentile(model.xyz_radius[:, 0].cpu().numpy(), 99))
+            _max_log_scale = np.log(model.config.upper_scale * _r99 * 3.0 + 1e-20)
+            scales = np.minimum(scales, _max_log_scale)
             for i in range(3):
                 map_to_tensors[f"scale_{i}"] = scales[:, i, None]
 
@@ -593,10 +650,195 @@ class ExportGaussianSplat(Exporter):
             for i in range(4):
                 map_to_tensors[f"rot_{i}"] = quats[:, i, None]
 
+            if hasattr(model, "gaussians_to_mesh_indices"):
+                map_to_tensors["mesh_face_idx"] = model.gaussians_to_mesh_indices.cpu().numpy().astype(np.int32)
+
+            # Vertex-anchored coverage-filler Gaussians (2026-07-26, see
+            # splatfacto_on_mesh_uc.py's populate_modules/get_outputs): a separate
+            # population, one per mesh vertex, not tied to any single face. Appended
+            # here so they actually show up in the exported PLY -- without this, the
+            # whole mechanism trains but is silently dropped at export time, since
+            # everything above only ever reads the face-based population.
+            # `is not None`, not just hasattr: with config.use_vertex_layer off the model
+            # sets vertex_gauss_params to None rather than omitting the attribute, so
+            # hasattr alone still passes and this block would then index into None.
+            if (
+                hasattr(model, "vertex_positions")
+                and getattr(model, "vertex_gauss_params", None) is not None
+            ):
+                v_positions = model.vertex_positions.cpu().numpy()
+                v_count = v_positions.shape[0]
+                map_to_tensors["x"] = np.concatenate([map_to_tensors["x"], v_positions[:, 0]])
+                map_to_tensors["y"] = np.concatenate([map_to_tensors["y"], v_positions[:, 1]])
+                map_to_tensors["z"] = np.concatenate([map_to_tensors["z"], v_positions[:, 2]])
+                v_normals = model.vertex_normals.cpu().numpy().astype(np.float32)
+                map_to_tensors["nx"] = np.concatenate([map_to_tensors["nx"], v_normals[:, 0]])
+                map_to_tensors["ny"] = np.concatenate([map_to_tensors["ny"], v_normals[:, 1]])
+                map_to_tensors["nz"] = np.concatenate([map_to_tensors["nz"], v_normals[:, 2]])
+
+                if model.config.sh_degree > 0:
+                    v_shs_0 = model.vertex_gauss_params["features_dc"].data.contiguous().cpu().numpy()
+                    for i in range(v_shs_0.shape[1]):
+                        map_to_tensors[f"f_dc_{i}"] = np.concatenate(
+                            [map_to_tensors[f"f_dc_{i}"], v_shs_0[:, i, None]]
+                        )
+                    v_shs_rest = (
+                        model.vertex_gauss_params["features_rest"].data.transpose(1, 2).contiguous().cpu().numpy()
+                    )
+                    v_shs_rest = v_shs_rest.reshape((v_count, -1))
+                    for i in range(v_shs_rest.shape[-1]):
+                        map_to_tensors[f"f_rest_{i}"] = np.concatenate(
+                            [map_to_tensors[f"f_rest_{i}"], v_shs_rest[:, i, None]]
+                        )
+                else:
+                    v_colors = torch.clamp(
+                        torch.sigmoid(model.vertex_gauss_params["features_dc"].data), 0.0, 1.0
+                    ).cpu().numpy()
+                    map_to_tensors["colors"] = np.concatenate(
+                        [map_to_tensors["colors"], (v_colors * 255).astype(np.uint8)]
+                    )
+
+                v_opacities = model.vertex_gauss_params["opacities"].data.cpu().numpy()
+                map_to_tensors["opacity"] = np.concatenate([map_to_tensors["opacity"], v_opacities])
+
+                # _vertex_scales()/_vertex_quats() (2026-07-31): the vertex layer's scale
+                # and rotation are now trainable-within-bounds, not the fixed
+                # vertex_log_scales/vertex_quats reference tensors -- reading those directly
+                # would silently export the pre-training values and throw away everything
+                # the optimizer learned, same class of bug as the original scales/opacities
+                # export mistake this file already documents fixing elsewhere.
+                v_scales = model._vertex_scales().detach().cpu().numpy()
+                # The vertex layer gets its OWN cap, not the face-based _max_log_scale
+                # above. That one is 3x the 99th percentile of upper_scale * xyz_radius --
+                # 3x what a FACE-based row may legitimately reach. A vertex row is bounded
+                # by exp(vertex_log_scales) instead, the vertex's 1-ring reach, which spans
+                # several faces and is legitimately larger than any one face's radius, so
+                # the face-derived cap does not describe a degenerate value here: it
+                # describes an ordinary one.
+                #
+                # Measured on table_gs11 before this fix: the face-derived cap sat at
+                # 0.00622 while the vertex layer's own ceiling had a median of 0.01025, so
+                # the shared cap clipped 89.5% of the layer. Worse, it clipped BOTH
+                # in-plane axes on 56.9% of it, which writes sx == sy and exports those
+                # rows as exact circles no matter what ellipse they render as -- the ply
+                # reported aspect median 1.000 with 57.3% circles for a layer whose true
+                # rendered aspect (read back from the checkpoint) is 1.2055 with 0.2%
+                # circles. Every viewer and every downstream analysis inherited that, and
+                # it read as "the vertex Gaussians are all circles" in exactly the way an
+                # unfixed anisotropy bug would.
+                #
+                # Same 3x-of-p99 rule and same purpose (keep a degenerate 1-ring from
+                # reaching 1e8 and crashing the viewer's rasterizer), just applied to the
+                # bound that actually governs this population.
+                _v99 = float(np.percentile(torch.exp(model.vertex_log_scales[:, :2]).cpu().numpy(), 99))
+                _max_log_scale_v = np.log(_v99 * 3.0 + 1e-20)
+                v_scales = np.minimum(v_scales, _max_log_scale_v)
+                for i in range(3):
+                    map_to_tensors[f"scale_{i}"] = np.concatenate(
+                        [map_to_tensors[f"scale_{i}"], v_scales[:, i, None]]
+                    )
+
+                v_quats = model._vertex_quats().detach().cpu().numpy()
+                for i in range(4):
+                    map_to_tensors[f"rot_{i}"] = np.concatenate([map_to_tensors[f"rot_{i}"], v_quats[:, i, None]])
+
+                # No single owning face -- honestly marked -1 (not an arbitrary
+                # incident face) rather than implying a face ownership that doesn't
+                # exist. Downstream tooling that assumes mesh_face_idx is always a
+                # valid face index needs updating to handle -1, not the other way
+                # around.
+                map_to_tensors["mesh_face_idx"] = np.concatenate(
+                    [map_to_tensors["mesh_face_idx"], np.full(v_count, -1, dtype=np.int32)]
+                )
+
+                n = n + v_count
+                count = n
+                CONSOLE.print(f"Exporting {v_count} additional vertex-anchored Gaussians ({n} total)")
+
+            # Face-centroid coverage-filler Gaussians (2026-07-27, see
+            # splatfacto_on_mesh_uc.py's populate_modules/get_outputs): same reasoning
+            # as the vertex-anchored block above -- without this the mechanism trains
+            # but is silently dropped at export time.
+            if hasattr(model, "centroid_positions") and hasattr(model, "centroid_gauss_params"):
+                c_positions = model.centroid_positions.cpu().numpy()
+                c_count = c_positions.shape[0]
+                map_to_tensors["x"] = np.concatenate([map_to_tensors["x"], c_positions[:, 0]])
+                map_to_tensors["y"] = np.concatenate([map_to_tensors["y"], c_positions[:, 1]])
+                map_to_tensors["z"] = np.concatenate([map_to_tensors["z"], c_positions[:, 2]])
+                c_normals = model.centroid_normals.cpu().numpy().astype(np.float32)
+                map_to_tensors["nx"] = np.concatenate([map_to_tensors["nx"], c_normals[:, 0]])
+                map_to_tensors["ny"] = np.concatenate([map_to_tensors["ny"], c_normals[:, 1]])
+                map_to_tensors["nz"] = np.concatenate([map_to_tensors["nz"], c_normals[:, 2]])
+
+                if model.config.sh_degree > 0:
+                    c_shs_0 = model.centroid_gauss_params["features_dc"].data.contiguous().cpu().numpy()
+                    for i in range(c_shs_0.shape[1]):
+                        map_to_tensors[f"f_dc_{i}"] = np.concatenate(
+                            [map_to_tensors[f"f_dc_{i}"], c_shs_0[:, i, None]]
+                        )
+                    c_shs_rest = (
+                        model.centroid_gauss_params["features_rest"].data.transpose(1, 2).contiguous().cpu().numpy()
+                    )
+                    c_shs_rest = c_shs_rest.reshape((c_count, -1))
+                    for i in range(c_shs_rest.shape[-1]):
+                        map_to_tensors[f"f_rest_{i}"] = np.concatenate(
+                            [map_to_tensors[f"f_rest_{i}"], c_shs_rest[:, i, None]]
+                        )
+                else:
+                    c_colors = torch.clamp(
+                        torch.sigmoid(model.centroid_gauss_params["features_dc"].data), 0.0, 1.0
+                    ).cpu().numpy()
+                    map_to_tensors["colors"] = np.concatenate(
+                        [map_to_tensors["colors"], (c_colors * 255).astype(np.uint8)]
+                    )
+
+                c_opacities = model.centroid_gauss_params["opacities"].data.cpu().numpy()
+                map_to_tensors["opacity"] = np.concatenate([map_to_tensors["opacity"], c_opacities])
+
+                c_scales = model.centroid_log_scales.cpu().numpy()
+                # Own cap, for the same reason the vertex block above needs one: this
+                # population's size comes from centroid_log_scales, not from
+                # upper_scale * xyz_radius, so the face-based cap is not the right
+                # reference for it either. (This layer is currently removed from the
+                # model -- see populate_modules' removal note -- so this path is dormant;
+                # fixed alongside the vertex block so it does not come back carrying the
+                # same defect.)
+                _c99 = float(np.percentile(np.exp(c_scales[:, :2]), 99))
+                _max_log_scale_c = np.log(_c99 * 3.0 + 1e-20)
+                c_scales = np.minimum(c_scales, _max_log_scale_c)
+                for i in range(3):
+                    map_to_tensors[f"scale_{i}"] = np.concatenate(
+                        [map_to_tensors[f"scale_{i}"], c_scales[:, i, None]]
+                    )
+
+                c_quats = model.centroid_quats.cpu().numpy()
+                for i in range(4):
+                    map_to_tensors[f"rot_{i}"] = np.concatenate([map_to_tensors[f"rot_{i}"], c_quats[:, i, None]])
+
+                # Unlike the vertex layer, a centroid Gaussian DOES belong to exactly
+                # one face -- mark it honestly with that face's real index rather than
+                # -1, since downstream tooling that groups by mesh_face_idx (e.g.
+                # report_coverage-style per-face analysis) can meaningfully attribute
+                # it. this does mean per-face Gaussian counts computed from
+                # mesh_face_idx will be one higher than gaussians_to_mesh_indices alone
+                # would suggest -- anything that assumes that equality needs updating.
+                map_to_tensors["mesh_face_idx"] = np.concatenate(
+                    [map_to_tensors["mesh_face_idx"], np.arange(c_count, dtype=np.int32)]
+                )
+
+                n = n + c_count
+                count = n
+                CONSOLE.print(f"Exporting {c_count} additional centroid-anchored Gaussians ({n} total)")
+
             if self.obb_center is not None and self.obb_rotation is not None and self.obb_scale is not None:
                 crop_obb = OrientedBox.from_params(self.obb_center, self.obb_rotation, self.obb_scale)
                 assert crop_obb is not None
-                mask = crop_obb.within(torch.from_numpy(positions)).numpy()
+                # positions must match map_to_tensors' current row count -- if the
+                # vertex-anchored and/or centroid-anchored filler populations were
+                # appended above, `positions` (captured before that) is stale/too short
+                # and would size-mismatch against map_to_tensors[k] below.
+                all_positions = np.stack([map_to_tensors["x"], map_to_tensors["y"], map_to_tensors["z"]], axis=-1)
+                mask = crop_obb.within(torch.from_numpy(all_positions)).numpy()
                 for k, t in map_to_tensors.items():
                     map_to_tensors[k] = map_to_tensors[k][mask]
 
@@ -607,6 +849,8 @@ class ExportGaussianSplat(Exporter):
         # to ensure the exported ply file has finite values, we enforce finite filters.
         select = np.ones(n, dtype=bool)
         for k, t in map_to_tensors.items():
+            if t.dtype == np.int32:
+                continue  # int fields cannot have NaN/Inf
             n_before = np.sum(select)
             if k in ["x", "y", "z"]:
                 select = np.logical_and(select, np.isfinite(t))
@@ -622,7 +866,14 @@ class ExportGaussianSplat(Exporter):
                 map_to_tensors[k] = map_to_tensors[k][select]
             count = np.sum(select)
 
-        ExportGaussianSplat.write_ply(str(filename), count, map_to_tensors)
+        mesh_verts_np = None
+        mesh_faces_np = None
+        if hasattr(model, "mesh_verts") and hasattr(model, "mesh_faces"):
+            mesh_verts_np = model.mesh_verts.cpu().numpy().astype(np.float32)
+            mesh_faces_np = model.mesh_faces.cpu().numpy().astype(np.int32)
+            CONSOLE.print(f"Exporting mesh: {mesh_verts_np.shape[0]} vertices, {mesh_faces_np.shape[0]} faces")
+
+        ExportGaussianSplat.write_ply(str(filename), count, map_to_tensors, mesh_verts_np, mesh_faces_np)
 
 
 Commands = tyro.conf.FlagConversionOff[

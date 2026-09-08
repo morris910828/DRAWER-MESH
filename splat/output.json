@@ -1,0 +1,17 @@
+{
+  "experiment_name": "armadillo1_mesh_gauss_splat",
+  "method_name": "splatfacto_on_mesh_uc",
+  "checkpoint": "outputs/armadillo1/armadillo1_mesh_gauss_splat/nerfstudio_models/step-000029999.ckpt",
+  "results": {
+    "psnr": 31.07880401611328,
+    "psnr_std": 0.9500587582588196,
+    "ssim": 0.9734441041946411,
+    "ssim_std": 0.004784253891557455,
+    "lpips": 0.04515247792005539,
+    "lpips_std": 0.01690143533051014,
+    "num_rays_per_sec": 10792954.0,
+    "num_rays_per_sec_std": 1562539.75,
+    "fps": 26.349985122680664,
+    "fps_std": 3.8147940635681152
+  }
+}

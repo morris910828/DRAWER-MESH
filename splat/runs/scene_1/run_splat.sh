@@ -9,14 +9,14 @@ sdf_dir="./outputs/cs_kitchen_n/cs_kitchen_n_sdf_recon/bakedsdf/2025-02-23_23262
 mesh_path=../sdf/${sdf_dir}/texture_mesh/mesh-simplify.obj
 save_extra_info_dir=./vis/${data_name}/gs_extra_info
 run_note="dense_1"
-area=2e-5 # increase this value if the splat is too dense
+area=5e-6 # increase this value if the splat is too dense
 
 python nerfstudio/scripts/train.py splatfacto_on_mesh_uc \
     --vis wandb  \
     --output-dir outputs/${data_name} \
     --experiment-name ${data_name}_mesh_gauss_splat \
     --pipeline.model.mesh_area_to_subdivide ${area} \
-    --pipeline.model.acm_lambda 1.0 \
+    --pipeline.model.acm_lambda 2.0 \
     --pipeline.model.elevate_coef 2.0 \
     --pipeline.model.upper_scale 2.0 \
     --pipeline.model.continue_cull_post_densification True \

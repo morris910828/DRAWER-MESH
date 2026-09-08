@@ -36,11 +36,7 @@ def apply_colormap(image: TensorType["bs":..., 1], cmap="viridis") -> TensorType
 
     colormap = cm.get_cmap(cmap)
     colormap = torch.tensor(colormap.colors).to(image.device)  # type: ignore
-    image_long = (image * 255).long()
-    image_long_min = torch.min(image_long)
-    image_long_max = torch.max(image_long)
-    assert image_long_min >= 0, f"the min value is {image_long_min}"
-    assert image_long_max <= 255, f"the max value is {image_long_max}"
+    image_long = (image.nan_to_num(nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0) * 255).long()
     return colormap[image_long[..., 0]]
 
 

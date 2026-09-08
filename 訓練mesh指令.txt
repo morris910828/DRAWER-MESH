@@ -1,0 +1,1 @@
+PYTHONPATH=/workspace/DRAWER-MESH/sdf bash scripts/run_stage1_single.sh

@@ -138,11 +138,11 @@ class SplatfactoModelConfig(ModelConfig):
     """If True, continue to cull gaussians post refinement"""
     reset_alpha_every: int = 30
     """Every this many refinement steps, reset the alpha"""
-    densify_grad_thresh: float = 0.0008
+    densify_grad_thresh: float = 0.0004
     """threshold of positional gradient norm for densifying gaussians"""
     densify_size_thresh: float = 0.01
     """below this size, gaussians are *duplicated*, otherwise split"""
-    n_split_samples: int = 2
+    n_split_samples: int = 3
     """number of samples to split gaussians into"""
     sh_degree_interval: int = 1000
     """every n intervals turn on another sh degree"""
@@ -160,16 +160,20 @@ class SplatfactoModelConfig(ModelConfig):
     "Size of the cube to initialize random gaussians within"
     ssim_lambda: float = 0.2
     """weight of ssim loss"""
-    stop_split_at: int = 15000
+    stop_split_at: int = 25000
     """stop splitting at this step"""
     sh_degree: int = 3
     """maximum degree of spherical harmonics to use"""
-    use_scale_regularization: bool = False
+    use_scale_regularization: bool = True
     """If enabled, a scale regularization introduced in PhysGauss (https://xpandora.github.io/PhysGaussian/) is used for reducing huge spikey gaussians."""
-    max_gauss_ratio: float = 10.0
+    max_gauss_ratio: float = 2.0
     """threshold of ratio of gaussian max to min scale before applying regularization
     loss from the PhysGaussian paper
     """
+    acm_lambda: float = 20.0
+    """weight of accumulation (coverage) loss to penalize transparent pixels"""
+    opacity_reg_lambda: float = 0.001
+    """weight of opacity binarization loss to push opacities towards 0 or 1"""
     output_depth_during_training: bool = False
     """If True, output depth during training. Otherwise, only output depth during evaluation."""
     rasterize_mode: Literal["classic", "antialiased"] = "classic"
@@ -510,10 +514,11 @@ class SplatfactoModel(Model):
                 self.remove_from_all_optim(optimizers, deleted_mask)
 
             if self.step < self.config.stop_split_at and self.step % reset_interval == self.config.refine_every:
-                # Reset value is set to be twice of the cull_alpha_thresh
                 reset_value = self.config.cull_alpha_thresh * 2.0
+                min_reset_value = self.config.cull_alpha_thresh * 1.5
                 self.opacities.data = torch.clamp(
                     self.opacities.data,
+                    min=torch.logit(torch.tensor(min_reset_value, device=self.device)).item(),
                     max=torch.logit(torch.tensor(reset_value, device=self.device)).item(),
                 )
                 # reset the exp of optimizer
@@ -548,6 +553,11 @@ class SplatfactoModel(Model):
                     toobigs = toobigs | (self.max_2Dsize > self.config.cull_screen_size).squeeze()
             culls = culls | toobigs
             toobigs_count = torch.sum(toobigs).item()
+        # hard-cull needle-like Gaussians regardless of step
+        scale_exp = torch.exp(self.scales)
+        needle_ratio = scale_exp.amax(dim=-1) / (scale_exp.amin(dim=-1) + 1e-8)
+        needles = (needle_ratio > self.config.max_gauss_ratio * 4).squeeze()
+        culls = culls | needles
         for name, param in self.gauss_params.items():
             self.gauss_params[name] = torch.nn.Parameter(param[~culls])
 
@@ -579,8 +589,16 @@ class SplatfactoModel(Model):
         new_opacities = self.opacities[split_mask].repeat(samps, 1)
         # step 4, sample new scales
         size_fac = 1.6
-        new_scales = torch.log(torch.exp(self.scales[split_mask]) / size_fac).repeat(samps, 1)
-        self.scales[split_mask] = torch.log(torch.exp(self.scales[split_mask]) / size_fac)
+        new_scales_exp = torch.exp(self.scales[split_mask]) / size_fac
+        # clamp ratio so split children are not needle-like
+        min_s = new_scales_exp.min(dim=-1, keepdim=True).values + 1e-8
+        max_s = new_scales_exp.max(dim=-1, keepdim=True).values
+        over = max_s / min_s > self.config.max_gauss_ratio * 2
+        if over.any():
+            allowed_max = min_s * self.config.max_gauss_ratio * 2
+            new_scales_exp = torch.where(over.expand_as(new_scales_exp), torch.minimum(new_scales_exp, allowed_max.expand_as(new_scales_exp)), new_scales_exp)
+        new_scales = torch.log(new_scales_exp + 1e-20).repeat(samps, 1)
+        self.scales[split_mask] = torch.log(new_scales_exp + 1e-20)
         # step 5, sample new quats
         new_quats = self.quats[split_mask].repeat(samps, 1)
         out = {
@@ -867,24 +885,36 @@ class SplatfactoModel(Model):
             gt_img = gt_img * mask
             pred_img = pred_img * mask
 
+        accumulation = outputs["accumulation"]
+        transparent_penalty = torch.nn.functional.relu(0.95 - accumulation)
+        transparent_mask = transparent_penalty > 0
+        if transparent_mask.any():
+            loss_acm = transparent_penalty[transparent_mask].mean() * self.config.acm_lambda
+        else:
+            loss_acm = transparent_penalty.sum()
+
+        opacity = torch.sigmoid(self.opacities)
+        opacity_reg = (opacity * (1.0 - opacity)).mean() * self.config.opacity_reg_lambda
+
         Ll1 = torch.abs(gt_img - pred_img).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
-        if self.config.use_scale_regularization and self.step % 10 == 0:
+        if self.config.use_scale_regularization:
             scale_exp = torch.exp(self.scales)
             scale_reg = (
                 torch.maximum(
                     scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1),
-                    torch.tensor(self.config.max_gauss_ratio),
+                    torch.tensor(self.config.max_gauss_ratio, device=self.device),
                 )
                 - self.config.max_gauss_ratio
             )
-            scale_reg = 0.1 * scale_reg.mean()
+            scale_reg = 0.5 * scale_reg.mean()
         else:
             scale_reg = torch.tensor(0.0).to(self.device)
 
         loss_dict = {
-            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss + loss_acm,
             "scale_reg": scale_reg,
+            "opacity_reg": opacity_reg,
         }
 
         if self.training:

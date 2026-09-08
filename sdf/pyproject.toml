@@ -14,35 +14,37 @@ classifiers = [
     "Programming Language :: Python",
 ]
 dependencies = [
+    # Pins relaxed for Python 3.11 / cu128 / RTX 5090. The original 2022-era
+    # pins (av==9.2.0, opencv==4.6.0.66, pymeshlab==2022.2.post2 …) no longer
+    # have cp311 wheels and force from-source builds that fail without
+    # ffmpeg dev headers, Cython, etc.
     "appdirs>=1.4",
-    "av==9.2.0",
+    "av>=10.0",
     "tyro>=0.3.31",
-    "gdown==4.6.0",
-    "ninja==1.10.2.3",
+    "gdown>=4.6",
+    "ninja>=1.10",
     "h5py>=2.9.0",
-    "imageio==2.21.1",
+    "imageio>=2.21",
     "ipywidgets>=7.6",
-    "jupyterlab==3.3.4",
-    "matplotlib==3.5.3",
-    "mediapy==1.1.0",
-    "msgpack==1.0.4",
-    "msgpack_numpy==0.4.8",
-    "nerfacc==0.3.5",
-    "opencv-python==4.6.0.66",
-    "plotly==5.7.0",
-    "protobuf==3.20.0",
-    "pymeshlab==2022.2.post2",
-    "pyngrok==5.1.0",
-    "python-socketio==5.7.1",
+    "matplotlib>=3.5",
+    "mediapy>=1.1",
+    "msgpack>=1.0",
+    "msgpack_numpy>=0.4.8",
+    "nerfacc==0.3.5",                     # KEEP — sdfstudio uses 0.3.x API
+    "opencv-python>=4.6",
+    "plotly>=5.7",
+    "protobuf>=3.20,<5",
+    "pymeshlab>=2022.2",
     "requests",
-    "rich==12.5.1",
-    "scikit-image==0.19.3",
-    "tensorboard==2.9.0",
+    "rich>=12.5",
+    "scikit-image>=0.19",
+    "tensorboard>=2.9",
     "u-msgpack-python>=2.4.1",
-    #"nuscenes-devkit>=1.1.1",
     "wandb>=0.13.3",
     "xatlas",
     "trimesh",
+    # Dropped (not used by stage 1 headless training):
+    #   jupyterlab, pyngrok, python-socketio
 ]
 
 

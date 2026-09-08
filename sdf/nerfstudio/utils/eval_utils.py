@@ -53,12 +53,17 @@ def eval_load_checkpoint(config: cfg.TrainerConfig, pipeline: Pipeline) -> Path:
                 justify="center",
             )
             sys.exit(1)
-        load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(config.load_dir))[-1]
+        # only parse periodic "step-<N>.ckpt" files; skip "best.ckpt" etc.
+        load_step = sorted(
+            int(x[x.find("-") + 1 : x.find(".")])
+            for x in os.listdir(config.load_dir)
+            if x.startswith("step-") and x.endswith(".ckpt")
+        )[-1]
     else:
         load_step = config.load_step
     load_path = config.load_dir / f"step-{load_step:09d}.ckpt"
     assert load_path.exists(), f"Checkpoint {load_path} does not exist"
-    loaded_state = torch.load(load_path, map_location="cpu")
+    loaded_state = torch.load(load_path, map_location="cpu", weights_only=False)
     pipeline.load_pipeline(loaded_state["pipeline"])
     CONSOLE.print(f":white_check_mark: Done loading checkpoint from {load_path}")
     return load_path

@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 import tyro
@@ -33,6 +33,9 @@ class ExtractMesh:
 
     # Path to config YAML file.
     load_config: Path
+    # Explicit checkpoint to load (e.g. .../sdfstudio_models/best.ckpt). If unset,
+    # eval_setup loads the latest periodic step-*.ckpt (skips best.ckpt).
+    checkpoint_path: Optional[Path] = None
     # Marching cube resolution.
     resolution: int = 1024
     # Name of the output file.
@@ -69,6 +72,14 @@ class ExtractMesh:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
 
         _, pipeline, _ = eval_setup(self.load_config)
+
+        # Optionally override the auto-loaded (latest) checkpoint with an explicit
+        # one, e.g. best.ckpt, which eval_load_checkpoint deliberately skips.
+        if self.checkpoint_path is not None:
+            assert self.checkpoint_path.exists(), f"checkpoint not found: {self.checkpoint_path}"
+            loaded_state = torch.load(self.checkpoint_path, map_location="cpu", weights_only=False)
+            pipeline.load_pipeline(loaded_state["pipeline"])
+            CONSOLE.print(f":white_check_mark: Overrode checkpoint with {self.checkpoint_path}")
 
         with open(self.output_path.parent / "train_image_paths.json", 'w') as f:
             image_filenames = pipeline.datamanager.train_dataset._dataparser_outputs.image_filenames

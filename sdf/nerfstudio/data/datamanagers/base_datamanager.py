@@ -63,7 +63,7 @@ from nerfstudio.data.utils.nerfstudio_collate import nerfstudio_collate
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes
 from nerfstudio.model_components.ray_generators import RayGenerator
 from nerfstudio.utils.images import BasicImages
-from nerfstudio.utils.misc import IterableWrapper
+from nerfstudio.utils.misc import IterableWrapper, get_dict_to_torch
 
 CONSOLE = Console(width=120)
 
@@ -262,7 +262,7 @@ class VanillaDataManagerConfig(InstantiateConfig):
 
     _target: Type = field(default_factory=lambda: VanillaDataManager)
     """Target class to instantiate."""
-    dataparser: AnnotatedDataParserUnion = BlenderDataParserConfig()
+    dataparser: AnnotatedDataParserUnion = field(default_factory=BlenderDataParserConfig)
     """Specifies the dataparser used to unpack the data."""
     train_num_rays_per_batch: int = 1024
     """Number of rays per batch to use per training iteration."""
@@ -280,7 +280,7 @@ class VanillaDataManagerConfig(InstantiateConfig):
     new images. If -1, never pick new images."""
     eval_image_indices: Optional[Tuple[int, ...]] = (0,)
     """Specifies the image indices to use during eval; if None, uses all."""
-    camera_optimizer: CameraOptimizerConfig = CameraOptimizerConfig()
+    camera_optimizer: CameraOptimizerConfig = field(default_factory=CameraOptimizerConfig)
     """Specifies the camera pose optimizer used during training. Helpful if poses are noisy, such as for data from
     Record3D."""
     collate_fn = staticmethod(nerfstudio_collate)
@@ -426,6 +426,8 @@ class VanillaDataManager(DataManager):  # pylint: disable=abstract-method
         self.train_count += 1
         image_batch = next(self.iter_train_image_dataloader)
         batch = self.train_pixel_sampler.sample(image_batch)
+        # Move only the small sampled batch (~N rays) to GPU, not the full dataset cache.
+        batch = get_dict_to_torch(batch, device=self.device, exclude=["image"])
         ray_indices = batch["indices"]
         ray_bundle = self.train_ray_generator(ray_indices)
         return ray_bundle, batch
@@ -435,6 +437,7 @@ class VanillaDataManager(DataManager):  # pylint: disable=abstract-method
         self.eval_count += 1
         image_batch = next(self.iter_eval_image_dataloader)
         batch = self.eval_pixel_sampler.sample(image_batch)
+        batch = get_dict_to_torch(batch, device=self.device, exclude=["image"])
         ray_indices = batch["indices"]
         ray_bundle = self.eval_ray_generator(ray_indices)
         return ray_bundle, batch

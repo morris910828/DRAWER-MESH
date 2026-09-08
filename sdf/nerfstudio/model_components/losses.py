@@ -268,8 +268,14 @@ def monosdf_normal_loss(normal_pred: torch.Tensor, normal_gt: torch.Tensor):
         normal_pred (torch.Tensor): volume rendered normal
         normal_gt (torch.Tensor): monocular normal
     """
-    normal_gt = torch.nn.functional.normalize(normal_gt, p=2, dim=-1)
-    normal_pred = torch.nn.functional.normalize(normal_pred, p=2, dim=-1)
+    # F.normalize's default eps=1e-12 caps the backward gradient at 1/eps = 1e12.
+    # normal_pred is the volume-rendered normal (sum of w_i * n_i), which tends to
+    # the zero vector on rays that never hit a surface -- and those get more common
+    # as beta anneals and the weights concentrate. A single such sample then pushes
+    # a ~1e12 gradient through the entire geometry MLP. A larger eps caps it at 1e6
+    # while leaving genuine normals (magnitude ~1) completely untouched.
+    normal_gt = torch.nn.functional.normalize(normal_gt, p=2, dim=-1, eps=1e-6)
+    normal_pred = torch.nn.functional.normalize(normal_pred, p=2, dim=-1, eps=1e-6)
     l1 = torch.abs(normal_pred - normal_gt).sum(dim=-1).mean()
     cos = (1.0 - torch.sum(normal_pred * normal_gt, dim=-1)).mean()
     return l1 + cos

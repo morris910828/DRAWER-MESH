@@ -817,6 +817,38 @@ method_configs["splatfacto_on_mesh_uc"] = TrainerConfig(
                 lr_final=1e-30, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
             ),
         },
+        # Vertex-anchored coverage-filler Gaussians (2026-07-26, see
+        # splatfacto_on_mesh_uc.py's populate_modules/get_outputs): a separate,
+        # fixed-position/scale/rotation population, one per mesh vertex, with only
+        # color and opacity trainable -- own param group names (not reusing
+        # "features_dc" etc.) because dup_in_optim()/remove_from_optim() assume
+        # exactly one tensor per group when the face-based population is
+        # split/duplicated/culled; mixing the two populations into the same group
+        # would break that surgery. Same LR as their face-based counterparts since
+        # they're the same kind of quantity, just a separate population.
+        "vertex_features_dc": {
+            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+            "scheduler": None,
+        },
+        "vertex_features_rest": {
+            "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
+            "scheduler": None,
+        },
+        "vertex_opacities": {
+            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
+            "scheduler": None,
+        },
+        # Scale/rotation made trainable-within-bounds 2026-07-31 (see
+        # splatfacto_on_mesh_uc.py's _vertex_scales()/_vertex_quats()). Same LR as
+        # their face-based counterparts (the "scales"/"quats" groups above).
+        "vertex_scales": {
+            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
+            "scheduler": None,
+        },
+        "vertex_quats": {
+            "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
+            "scheduler": None,
+        },
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
     vis="viewer",
@@ -876,6 +908,31 @@ method_configs["splatfacto_on_mesh_uc_longer"] = TrainerConfig(
             "scheduler": ExponentialDecaySchedulerConfig(
                 lr_final=1e-30, max_steps=100000, warmup_steps=1000, lr_pre_warmup=0
             ),
+        },
+        # See splatfacto_on_mesh_uc's optimizers dict above for why these exist as
+        # their own param groups rather than reusing "features_dc" etc.
+        "vertex_features_dc": {
+            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+            "scheduler": None,
+        },
+        "vertex_features_rest": {
+            "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
+            "scheduler": None,
+        },
+        "vertex_opacities": {
+            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
+            "scheduler": None,
+        },
+        # Scale/rotation made trainable-within-bounds 2026-07-31 (see
+        # splatfacto_on_mesh_uc.py's _vertex_scales()/_vertex_quats()). Same LR as
+        # their face-based counterparts (the "scales"/"quats" groups above).
+        "vertex_scales": {
+            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
+            "scheduler": None,
+        },
+        "vertex_quats": {
+            "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
+            "scheduler": None,
         },
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),

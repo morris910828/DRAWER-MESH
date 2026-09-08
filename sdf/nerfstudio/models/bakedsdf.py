@@ -110,7 +110,15 @@ def compute_scale_and_shift_batch(prediction, target):
     dr = prediction.unsqueeze(-1) # (B, N, 1)
     dr = torch.cat((dr, torch.ones_like(dr).to(dr.device)), dim=-1).reshape(-1, 2, 1)  # (BxN, 2, 1)
     dr_sq = torch.sum((dr @ dr.transpose(1, 2)).reshape(B, N, 2, 2), dim=1) # (B, 2, 2)
-    left_part = torch.inverse(dr_sq).reshape(B, 2, 2) # (B, 2, 2)
+    # dr_sq is a Gram matrix whose determinant is N^2 * Var(prediction).  On patches
+    # where the rendered depth barely varies -- rays that miss the surface collapse to
+    # the same value, which gets more common as beta anneals -- it goes singular: in
+    # float32 the determinant is already negative (i.e. pure numerical noise) by the
+    # time the depth std reaches 3e-5, and the gradient through the inverse is
+    # amplified ~3000x.  A tiny ridge term keeps it invertible and leaves well
+    # conditioned patches untouched.
+    ridge = 1e-4 * torch.eye(2, device=dr_sq.device, dtype=dr_sq.dtype).unsqueeze(0)
+    left_part = torch.inverse(dr_sq + ridge).reshape(B, 2, 2) # (B, 2, 2)
     right_part = torch.sum((dr.reshape(B, N, 2, 1))*(target.reshape(B, N, 1, 1)), dim=1).reshape(B, 2, 1)
     rs = left_part @ right_part # (B, 2, 1)
     rs = rs.reshape(B, 2)
@@ -288,6 +296,12 @@ class BakedSDFFactoModel(VolSDFModel):
         if self.training:
             # eikonal loss
             grad_theta = outputs["eik_grad"]
+            # torch.norm() backpropagates NaN wherever the input vector is exactly
+            # zero (d||x||/dx = x/||x|| -> 0/0).  As beta anneals the surface gets
+            # sharper and the SDF flattens away from it, so samples with grad == 0
+            # become common; every one of them poisons the gradient of the whole
+            # geometry MLP.  Take the norm through an epsilon-guarded sqrt instead.
+            grad_norm = torch.sqrt(torch.sum(grad_theta**2, dim=-1) + 1e-12)
             # s3im loss
             if self.config.s3im_loss_mult > 0:
                 loss_dict["s3im_loss"] = self.s3im_loss(image, outputs["rgb"]) * self.config.s3im_loss_mult
@@ -305,10 +319,10 @@ class BakedSDFFactoModel(VolSDFModel):
                     1 + (weight_end - weight_init) / weight_init * ((2.0 - points_weights) ** slop)
                 )
 
-                loss_dict["eikonal_loss"] = (((grad_theta.norm(2, dim=-1) - 1) ** 2) * points_weights).mean()
+                loss_dict["eikonal_loss"] = (((grad_norm - 1) ** 2) * points_weights).mean()
             else:
                 loss_dict["eikonal_loss"] = (
-                    (grad_theta.norm(2, dim=-1) - 1) ** 2
+                    (grad_norm - 1) ** 2
                 ).mean() * self.config.eikonal_loss_mult
 
             loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(

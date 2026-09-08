@@ -23,6 +23,7 @@ from nerfstudio.data.datamanagers.base_datamanager import (
     VanillaDataManager,
     VanillaDataManagerConfig,
 )
+from nerfstudio.utils.misc import get_dict_to_torch
 from nerfstudio.data.datasets.panoptic_dataset import PanopticDataset, PanopticSegmentDataset
 from nerfstudio.cameras.rays import RayBundle
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -112,6 +113,7 @@ class PanopticDataManager(VanillaDataManager):  # pylint: disable=abstract-metho
         self.train_count += 1
         image_batch = next(self.iter_train_image_dataloader)
         batch = self.train_pixel_sampler.sample(image_batch)
+        batch = get_dict_to_torch(batch, device=self.device, exclude=["image"])
         ray_indices = batch["indices"]
         ray_bundle = self.train_ray_generator(ray_indices)
 

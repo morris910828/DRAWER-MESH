@@ -81,6 +81,7 @@ class Trainer:
             self.mixed_precision = False
             CONSOLE.print("Mixed precision is disabled for CPU training.")
         self._start_step = 0
+        self._best_psnr = -float("inf")
         # optimizers
         self.grad_scaler = GradScaler(enabled=self.mixed_precision)
 
@@ -258,11 +259,12 @@ class Trainer:
             load_step = self.config.trainer.load_step
             if load_step is None:
                 print("Loading latest checkpoint from load_dir")
-                # NOTE: this is specific to the checkpoint name format
-                load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(load_dir))[-1]
+                # NOTE: this is specific to the checkpoint name format (step-XXXXXXXXX.ckpt)
+                step_files = [x for x in os.listdir(load_dir) if x.startswith("step-") and x.endswith(".ckpt")]
+                load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in step_files)[-1]
             load_path = load_dir / f"step-{load_step:09d}.ckpt"
             assert load_path.exists(), f"Checkpoint {load_path} does not exist"
-            loaded_state = torch.load(load_path, map_location="cpu")
+            loaded_state = torch.load(load_path, map_location="cpu", weights_only=False)
             self._start_step = loaded_state["step"] + 1
             # load the checkpoints for pipeline, optimizers, and gradient scalar
             self.pipeline.load_pipeline(loaded_state["pipeline"])
@@ -300,9 +302,9 @@ class Trainer:
         )
         # possibly delete old checkpoints
         if self.config.trainer.save_only_latest_checkpoint:
-            # delete everything else in the checkpoint folder
+            # delete everything else in the checkpoint folder (but keep the best-* checkpoint)
             for f in self.checkpoint_dir.glob("*"):
-                if f != ckpt_path:
+                if f != ckpt_path and not f.name.startswith("best"):
                     f.unlink()
 
     @profiler.time_function
@@ -319,7 +321,49 @@ class Trainer:
                 _, loss_dict, metrics_dict = self.pipeline.get_train_loss_dict(step=step)
                 loss = functools.reduce(torch.add, loss_dict.values())
             self.grad_scaler.scale(loss).backward()  # type: ignore
-        self.optimizers.optimizer_scaler_step_all(self.grad_scaler)
+        # --- numerical safety guard -------------------------------------------------
+        # A single non-finite forward/backward permanently corrupts the network: once
+        # the optimizer writes NaN/Inf into the weights, every later forward is NaN and
+        # training never recovers (observed: all losses -> NaN at one step, flat after).
+        # A non-finite loss means the whole batch is unusable, so that step is dropped.
+        # A non-finite *gradient* is different: at full resolution the tcnn hash grid's
+        # fp16 backward overflows a handful of entries out of >12M, and dropping the
+        # whole step for those few locks training up permanently (every step gets
+        # dropped, loss goes flat). Zero just the offending entries instead and keep
+        # the step -- the clipped grad-norm is re-checked below as a backstop.
+        # mixed_precision=False here, so grads are at true scale (no unscale needed).
+        skip_step = not bool(torch.isfinite(loss))
+        if not skip_step:
+            num_bad = 0
+            for param in self.pipeline.parameters():
+                if param.grad is not None:
+                    bad = ~torch.isfinite(param.grad)
+                    if bool(bad.any()):
+                        num_bad += int(bad.sum())
+                        param.grad[bad] = 0.0
+            if num_bad > 0:
+                self._num_zeroed_grads = getattr(self, "_num_zeroed_grads", 0) + 1
+                if self._num_zeroed_grads <= 20 or self._num_zeroed_grads % 500 == 0:
+                    CONSOLE.log(
+                        f"[yellow]Zeroed {num_bad} non-finite grad entries at step {step} "
+                        f"(steps affected: {self._num_zeroed_grads}); step kept.[/yellow]"
+                    )
+        if self.config.trainer.gradient_clipping_val > 0:
+            total_norm = torch.nn.utils.clip_grad_norm_(
+                self.pipeline.parameters(), self.config.trainer.gradient_clipping_val
+            )
+            if not bool(torch.isfinite(total_norm)):
+                skip_step = True
+        if skip_step:
+            self.optimizers.zero_grad_all()
+            self._num_skipped_steps = getattr(self, "_num_skipped_steps", 0) + 1
+            if self._num_skipped_steps <= 50 or self._num_skipped_steps % 100 == 0:
+                CONSOLE.log(
+                    f"[yellow]Non-finite loss/grad at step {step}; skipped optimizer step "
+                    f"(total skipped: {self._num_skipped_steps}).[/yellow]"
+                )
+        else:
+            self.optimizers.optimizer_scaler_step_all(self.grad_scaler)
         self.grad_scaler.update()
         self.optimizers.scheduler_step_all(step)
 
@@ -357,6 +401,31 @@ class Trainer:
             group = "Eval Images"
             for image_name, image in images_dict.items():
                 writer.put_image(name=group + "/" + image_name, image=image, step=step)
+            if self.config.trainer.save_best_checkpoint:
+                psnr = metrics_dict.get("psnr", float("-inf"))
+                if psnr > self._best_psnr:
+                    self._best_psnr = psnr
+                    if not self.checkpoint_dir.exists():
+                        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                    # filename carries the step so the best step is recoverable; drop the
+                    # previous best (and any legacy best.ckpt) so only the current one remains.
+                    for old in self.checkpoint_dir.glob("best-step-*.ckpt"):
+                        old.unlink()
+                    (self.checkpoint_dir / "best.ckpt").unlink(missing_ok=True)
+                    best_path = self.checkpoint_dir / f"best-step-{step:09d}.ckpt"
+                    torch.save(
+                        {
+                            "step": step,
+                            "pipeline": self.pipeline.module.state_dict()
+                            if hasattr(self.pipeline, "module")
+                            else self.pipeline.state_dict(),
+                            "optimizers": {k: v.state_dict() for k, v in self.optimizers.optimizers.items()},
+                            "schedulers": {k: v.state_dict() for k, v in self.optimizers.schedulers.items()},
+                            "scalers": self.grad_scaler.state_dict(),
+                        },
+                        best_path,
+                    )
+                    CONSOLE.log(f"[green]New best PSNR {psnr:.3f} at step {step} → saved {best_path.name}[/green]")
 
         # all eval images
         if step_check(step, self.config.trainer.steps_per_eval_all_images):

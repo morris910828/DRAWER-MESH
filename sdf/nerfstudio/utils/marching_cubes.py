@@ -7,6 +7,12 @@ import trimesh
 from skimage import measure
 import pymeshlab
 
+# ---- SIMPLIFY_ONLY switch (equivalent of #ifdef) ----
+# Set to True to run this file directly for standalone mesh simplification.
+# When False (default), this file behaves as a normal importable module.
+SIMPLIFY_ONLY = False
+# -----------------------------------------------------
+
 avg_pool_3d = torch.nn.AvgPool3d(2, stride=2)
 upsample = torch.nn.Upsample(scale_factor=2, mode="nearest")
 max_pool_3d = torch.nn.MaxPool3d(3, stride=1, padding=1)
@@ -26,7 +32,7 @@ def remesh(verts, faces):
     ms = pymeshlab.MeshSet()
     ms.add_mesh(pml_mesh, 'mesh')
 
-    ms.apply_filter('meshing_isotropic_explicit_remeshing', targetlen=pymeshlab.AbsoluteValue(mean_edge_len))
+    ms.apply_filter('meshing_isotropic_explicit_remeshing', targetlen=pymeshlab.PureValue(mean_edge_len))
 
     m = ms.current_mesh()
     verts = m.vertex_matrix()
@@ -179,8 +185,8 @@ def get_surface_sliding(
     else:
         filename = str(output_path)
         filename_simplify = str(output_path).replace(".ply", "-simplify.ply")
-        combined.merge_vertices(digits_vertex=6)
-        combined.export(filename)
+        # combined.merge_vertices(digits_vertex=6)
+        # combined.export(filename)
         if simplify_mesh:
             ms = pymeshlab.MeshSet()
             ms.load_new_mesh(filename)
@@ -254,6 +260,32 @@ def get_surface_sliding_with_contraction(
     world_transform=torch.eye(4)
 ):
     assert resolution % 512 == 0
+
+    if SIMPLIFY_ONLY:
+        filename = str(output_path)
+        filename_simplify = filename.replace(".ply", "-simplify.ply")
+        ms = pymeshlab.MeshSet()
+        ms.load_new_mesh(filename)
+        print("simplify mesh")
+        ms.meshing_decimation_quadric_edge_collapse(targetfacenum=target_faces_num)
+        min_f = 10000
+        if min_f > 0:
+            ms.meshing_remove_connected_component_by_face_number(mincomponentsize=min_f)
+        print("remeshing...")
+        m = ms.current_mesh()
+        verts, faces = remesh(m.vertex_matrix(), m.face_matrix())
+        # apply world transform (nerfstudio normalized → COLMAP world) if provided
+        wt = world_transform.cpu().numpy() if hasattr(world_transform, 'cpu') else np.array(world_transform)
+        if not np.allclose(wt, np.eye(4)):
+            verts_pad = np.pad(verts, ((0, 0), (0, 1)), constant_values=1.0)
+            verts_pad = verts_pad @ wt.T
+            verts = verts_pad[:, :3] / verts_pad[:, 3:]
+            print(f"applied world_transform, new bounds: {verts.min(0).round(3)} -> {verts.max(0).round(3)}")
+        ms = pymeshlab.MeshSet()
+        ms.add_mesh(pymeshlab.Mesh(verts, faces), "mesh")
+        ms.save_current_mesh(filename_simplify, save_face_color=False)
+        print(f"saved -> {filename_simplify}")
+        return
 
     resN = resolution
     cropN = 256
@@ -371,11 +403,11 @@ def get_surface_sliding_with_contraction(
             ms.load_new_mesh(filename)
 
             print("simplify mesh")
-            ms.simplification_quadric_edge_collapse_decimation(targetfacenum=target_faces_num)
+            ms.meshing_decimation_quadric_edge_collapse(targetfacenum=target_faces_num)
             min_f = 10000
             # min_f = 10
             if min_f > 0:
-                ms.remove_isolated_pieces_wrt_face_num(mincomponentsize=min_f)
+                ms.meshing_remove_connected_component_by_face_number(mincomponentsize=min_f)
 
             # do an extra isotropic remeshing
             print("remeshing...")
@@ -551,11 +583,11 @@ def get_surface_sliding_with_contraction_external_boxes(
         ms.load_new_mesh(filename)
 
         print("simplify mesh")
-        ms.simplification_quadric_edge_collapse_decimation(targetfacenum=1000)
+        ms.meshing_decimation_quadric_edge_collapse(targetfacenum=1000)
         min_f = 10000
         # min_f = 10
         if min_f > 0:
-            ms.remove_isolated_pieces_wrt_face_num(mincomponentsize=min_f)
+            ms.meshing_remove_connected_component_by_face_number(mincomponentsize=min_f)
 
         # do an extra isotropic remeshing
         print("remeshing...")
@@ -692,5 +724,39 @@ def get_surface_sliding_with_contraction_external_boxes(
             ms.load_new_mesh(filename)
 
             print("simply mesh")
-            ms.simplification_quadric_edge_collapse_decimation(targetfacenum=1000000)
+            ms.meshing_decimation_quadric_edge_collapse(targetfacenum=1000000)
             ms.save_current_mesh(filename, save_face_color=False)
+
+
+# if __name__ == "__main__" and SIMPLIFY_ONLY:
+#     import argparse
+
+#     parser = argparse.ArgumentParser(description="Standalone mesh simplification")
+#     parser.add_argument("input", type=str, help="Input .ply file path")
+#     parser.add_argument("--target-faces", type=int, default=1000000, help="Target face count after decimation")
+#     parser.add_argument("--min-component", type=int, default=10000, help="Min face count to keep a component (0 = skip)")
+#     parser.add_argument("--output", type=str, default=None, help="Output .ply path (default: input stem + -simplify.ply)")
+#     args = parser.parse_args()
+
+#     _in = args.input
+#     _out = args.output or _in.replace(".ply", "-simplify.ply")
+
+#     print(f"[simplify] loading {_in}")
+#     _ms = pymeshlab.MeshSet()
+#     _ms.load_new_mesh(_in)
+
+#     print(f"[simplify] decimation → {args.target_faces} faces")
+#     _ms.meshing_decimation_quadric_edge_collapse(targetfacenum=args.target_faces)
+
+#     if args.min_component > 0:
+#         print(f"[simplify] removing isolated pieces < {args.min_component} faces")
+#         _ms.meshing_remove_connected_component_by_face_number(mincomponentsize=args.min_component)
+
+#     print("[simplify] isotropic remeshing...")
+#     _m = _ms.current_mesh()
+#     _verts, _faces = remesh(_m.vertex_matrix(), _m.face_matrix())
+#     _ms = pymeshlab.MeshSet()
+#     _ms.add_mesh(pymeshlab.Mesh(_verts, _faces), "mesh")
+
+#     _ms.save_current_mesh(_out, save_face_color=False)
+#     print(f"[simplify] saved → {_out}")

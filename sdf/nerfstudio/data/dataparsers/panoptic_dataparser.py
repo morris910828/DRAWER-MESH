@@ -479,6 +479,24 @@ class Panoptic(DataParser):
 
 
         # we should also transform normal accordingly
+        _df = (self.config.downscale_factor or 1)
+
+        # Target size for the monocular depth/normal maps: whatever the RGB images are
+        # actually loaded at. _get_fname() serves them straight out of images_<_df>/ and
+        # does NOT rescale them, so the target is the full-res dimensions divided by _df.
+        #
+        # These maps do not have a guaranteed resolution: run_stage1_single.sh points
+        # Marigold at images_<_df>/ whenever DOWNSCALE_FACTOR > 1, so they come out already
+        # downscaled, while a DOWNSCALE_FACTOR=1 run (or Marigold pointed at images/) yields
+        # full-res ones. The previous code divided by _df unconditionally, which turned the
+        # already-downscaled case into 1/_df of the RGB size -- the pixel sampler then indexed
+        # a 1392-wide image's coordinates into a 348-wide tensor and raised IndexError.
+        # Resizing to an explicit target instead handles both cases, and is a no-op when the
+        # maps already match.
+        _tgt_h = int(meta["h"]) // _df if height_fixed else None
+        _tgt_w = int(meta["w"]) // _df if width_fixed else None
+        _have_tgt = _tgt_h is not None and _tgt_w is not None
+
         if self.config.mono_normal_data:
             normal_paths = filter_list(normal_images, indices)
             normal_images = []
@@ -487,6 +505,20 @@ class Panoptic(DataParser):
                 normal = normal * 2.0 - 1.0  # omnidata output is normalized so we convert it back to normal here
                 normal = torch.from_numpy(normal).float()
                 normal[..., 1:3] *= -1
+                if _have_tgt:
+                    if (normal.shape[0], normal.shape[1]) != (_tgt_h, _tgt_w):
+                        normal = torch.nn.functional.interpolate(
+                            normal.permute(2, 0, 1).unsqueeze(0),
+                            size=(_tgt_h, _tgt_w), mode='bilinear', align_corners=False,
+                        ).squeeze(0).permute(1, 2, 0)
+                elif _df > 1 and normal.shape[0] % _df == 0:
+                    # No fixed h/w in transforms.json to derive a target from; fall back to
+                    # the original divide-by-_df behavior.
+                    th, tw = normal.shape[0] // _df, normal.shape[1] // _df
+                    normal = torch.nn.functional.interpolate(
+                        normal.permute(2, 0, 1).unsqueeze(0),
+                        size=(th, tw), mode='bilinear', align_corners=False,
+                    ).squeeze(0).permute(1, 2, 0)
                 normal_images.append(normal)
 
             normal_images_aligned = []
@@ -503,6 +535,19 @@ class Panoptic(DataParser):
 
             for dpath in depth_paths:
                 depth_frame = torch.from_numpy(np.load(dpath)).float()
+                if _have_tgt:
+                    if (depth_frame.shape[0], depth_frame.shape[1]) != (_tgt_h, _tgt_w):
+                        depth_frame = torch.nn.functional.interpolate(
+                            depth_frame.unsqueeze(0).unsqueeze(0),
+                            size=(_tgt_h, _tgt_w), mode='bilinear', align_corners=False,
+                        ).squeeze(0).squeeze(0)
+                elif _df > 1 and depth_frame.shape[0] % _df == 0:
+                    # See the normal branch above: fallback when h/w aren't fixed in meta.
+                    th, tw = depth_frame.shape[0] // _df, depth_frame.shape[1] // _df
+                    depth_frame = torch.nn.functional.interpolate(
+                        depth_frame.unsqueeze(0).unsqueeze(0),
+                        size=(th, tw), mode='bilinear', align_corners=False,
+                    ).squeeze(0).squeeze(0)
                 depth_images.append(depth_frame)
 
         if self.config.mask_data:

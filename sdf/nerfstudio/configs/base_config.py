@@ -33,6 +33,8 @@ from nerfstudio.configs.config_utils import to_immutable_dict
 # model instances
 from nerfstudio.utils import writer
 
+from dataclasses import dataclass, field
+
 warnings.filterwarnings("ignore", module="torchvision")
 
 CONSOLE = Console(width=120)
@@ -122,7 +124,8 @@ class LoggingConfig(PrintableConfig):
     max_buffer_size: int = 20
     """maximum history size to keep for computing running averages of stats.
      e.g. if 20, averages will be computed over past 20 occurances."""
-    local_writer: LocalWriterConfig = LocalWriterConfig(enable=True)
+    # local_writer: LocalWriterConfig = LocalWriterConfig(enable=True)
+    local_writer: LocalWriterConfig = field(default_factory=LocalWriterConfig)
     """if provided, will print stats locally. if None, will disable printing"""
     enable_profiler: bool = True
     """whether to enable profiling code; prints speed of functions at the end of a program.
@@ -152,6 +155,8 @@ class TrainerConfig(PrintableConfig):
     """Relative path to save all checkpoints."""
     save_only_latest_checkpoint: bool = True
     """Whether to only save the latest checkpoint or all checkpoints."""
+    save_best_checkpoint: bool = False
+    """Whether to save best.ckpt whenever eval PSNR improves (requires steps_per_eval_image > 0)."""
     # optional parameters if we want to resume training
     load_dir: Optional[Path] = None
     """Optionally specify a pre-trained model directory to load from."""
@@ -163,6 +168,9 @@ class TrainerConfig(PrintableConfig):
     """Whether to load the lr scheduler state_dict if exists"""
     accumulate_grad_steps: int = 1
     """Number of gradient steps to accumulate before taking an optimizer step."""
+    gradient_clipping_val: float = 0.0
+    """Max grad-norm for gradient clipping (0 disables). Guards against single-step
+    explosions that can collapse the network into a degenerate state it never recovers from."""
 
 
 # Viewer related configs
@@ -209,15 +217,15 @@ class Config(PrintableConfig):
     """Experiment name. If None, will automatically be set to dataset name"""
     timestamp: str = "{timestamp}"
     """Experiment timestamp."""
-    machine: MachineConfig = MachineConfig()
+    machine: MachineConfig = field(default_factory=MachineConfig)
     """Machine configuration"""
-    logging: LoggingConfig = LoggingConfig()
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     """Logging configuration"""
-    viewer: ViewerConfig = ViewerConfig()
+    viewer: ViewerConfig = field(default_factory=ViewerConfig)
     """Viewer configuration"""
-    trainer: TrainerConfig = TrainerConfig()
+    trainer: TrainerConfig = field(default_factory=TrainerConfig)
     """Trainer configuration"""
-    pipeline: VanillaPipelineConfig = VanillaPipelineConfig()
+    pipeline: VanillaPipelineConfig = field(default_factory=VanillaPipelineConfig)
     """Pipeline configuration"""
     optimizers: Dict[str, Any] = to_immutable_dict(
         {
