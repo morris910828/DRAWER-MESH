@@ -22,7 +22,14 @@ source_group("Resources Files" FILES ${RESOURCES})
 
 add_executable(${PROJECT_NAME} ${SOURCES})
 
-target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_SOURCE_DIR}/../submodules/diff-gaussian-rasterization/third_party/glm")
+# glm ships inside the CudaRasterizer extlib (diff-gaussian-rasterization). The
+# old path assumed a sibling submodules/ dir from the original 3DGS repo layout,
+# which does not exist in this checkout.
+if(EXISTS "${CMAKE_SOURCE_DIR}/../submodules/diff-gaussian-rasterization/third_party/glm")
+	target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_SOURCE_DIR}/../submodules/diff-gaussian-rasterization/third_party/glm")
+else()
+	target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_SOURCE_DIR}/extlibs/CudaRasterizer/CudaRasterizer/third_party/glm")
+endif()
 
 target_link_libraries(${PROJECT_NAME}
 
