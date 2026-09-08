@@ -23,6 +23,8 @@ hs_err_*
 !src/projects/ulr/
 !src/projects/dataset_tools/
 !src/projects/gaussianviewer/
+!src/projects/basic/
+!src/projects/remote/
 
 # more vim garbage
 # Swap
