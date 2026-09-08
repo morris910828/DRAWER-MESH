@@ -1,4 +1,23 @@
-extlibs/
+# extlibs: ignore all downloaded / cloned dependencies, EXCEPT the two libraries
+# we modified locally and vendor directly in this repo (imgui, CudaRasterizer).
+extlibs/*
+!extlibs/CudaRasterizer/
+!extlibs/imgui/
+!extlibs/VENDORED_LIBS.md
+extlibs/CudaRasterizer/*
+!extlibs/CudaRasterizer/CudaRasterizer/
+extlibs/imgui/*
+!extlibs/imgui/imgui/
+# still exclude their build output / trimmed sub-trees
+extlibs/CudaRasterizer/CudaRasterizer/build/
+extlibs/CudaRasterizer/build/
+extlibs/CudaRasterizer/subbuild/
+extlibs/imgui/imgui/build/
+extlibs/imgui/build/
+extlibs/imgui/subbuild/
+extlibs/CudaRasterizer/CudaRasterizer/third_party/glm/doc/
+extlibs/CudaRasterizer/CudaRasterizer/third_party/glm/test/
+
 build/
 install/
 src/projects/*

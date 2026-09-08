@@ -127,6 +127,16 @@ function(sibr_gitlibrary)
             endif()
         endif()
 
+        # Vendored library: if the source directory is already populated in the
+        # repository (contains a CMakeLists.txt) but has no .git, use it as-is and
+        # never let FetchContent clone over it. This preserves local modifications
+        # to extlibs that are committed directly into this repository.
+        if((NOT SIBR_GITLIBRARY_DECLARED) AND
+           (EXISTS ${CMAKE_SOURCE_DIR}/extlibs/${args_ROOT_DIR}/${args_SOURCE_DIR}/CMakeLists.txt))
+            message(STATUS "Library ${args_TARGET} pre-populated in extlibs/${args_ROOT_DIR}/${args_SOURCE_DIR}, using local copy.")
+            set(SIBR_GITLIBRARY_DECLARED ON)
+        endif()
+
         FetchContent_Declare(${args_TARGET}
             GIT_REPOSITORY 	${args_GIT_REPOSITORY}
             GIT_TAG			${args_GIT_TAG}
