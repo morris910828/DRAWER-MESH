@@ -233,6 +233,12 @@ namespace sibr {
 		if (input.key().isActivated(Key::LeftControl)) {
 			state = TrackBallState::IDLE;
 		}
+		// Shift + mouse is reserved for tools that paint on the scene (e.g. the
+		// gaussianViewer brush selection); keep the trackball out of it, the same
+		// way the FPS camera already ignores mouse pan while Shift is held.
+		else if (input.key().isActivated(Key::LeftShift)) {
+			state = TrackBallState::IDLE;
+		}
 		else if (input.mouseButton().isPressed(Mouse::Right)) {
 			lastPoint2D = currentPoint2D;
 			tempCamera = fixedCamera;

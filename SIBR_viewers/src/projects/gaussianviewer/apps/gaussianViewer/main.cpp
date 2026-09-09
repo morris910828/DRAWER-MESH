@@ -200,6 +200,7 @@ public:
             if (_showGaussianOutlines) renderGaussianOutlines(eye);
             _wireframeRenderer.render(_mesh, _expMapSolver.GetActiveTriIndices(), mvp, _showMesh,
                                       _expMapSolver.GetActiveGeneration());
+            renderBrushOverlay(eye);
             dst.unbind();
         }
     }
@@ -207,9 +208,45 @@ public:
     void onUpdate(sibr::Input& input) override {
         if (!_gaussianView) return;
         _gaussianView->onUpdate(input);
-        if (input.mouseButton().isReleased(sibr::Mouse::Right) &&
-            input.key().isActivated(sibr::Key::LeftShift))
-            performRaycast(input);
+
+        const bool shift = input.key().isActivated(sibr::Key::LeftShift);
+        const sibr::Vector2f mouse((float)input.mousePosition().x(),
+                                   (float)input.mousePosition().y());
+
+        if (shift && input.mouseButton().isPressed(sibr::Mouse::Right)) {
+            // Start a stroke on the press so we can sample the drag path.
+            sibr::Vector3f hp; int tri = -1;
+            if (raycastMesh(input, hp, tri)) {
+                _brushing        = true;
+                _strokePoints    = { hp };
+                _strokeTriIDs    = { tri };
+                _lastSampleMouse = mouse;
+            }
+        } else if (_brushing && shift &&
+                   input.mouseButton().isActivated(sibr::Mouse::Right)) {
+            // Brush drag: append a sample once the cursor has moved far enough,
+            // and only if the new surface point is a real step along the stroke.
+            if ((mouse - _lastSampleMouse).norm() > 6.f) {
+                sibr::Vector3f hp; int tri = -1;
+                if (raycastMesh(input, hp, tri)) {
+                    const float step = (hp - _strokePoints.back()).norm();
+                    const float stepMin = std::max(1e-3f, _expMapRadius * 0.30f);
+                    // Skip a jump big enough to be the cursor slipping onto another
+                    // surface -- it would make the polyline bridge across a gap.
+                    const float stepMax = std::max(0.05f, _expMapRadius * 3.0f);
+                    if (step > stepMin && step < stepMax) {
+                        _strokePoints.push_back(hp);
+                        _strokeTriIDs.push_back(tri);
+                    }
+                    _lastSampleMouse = mouse;
+                }
+            }
+        } else if (_brushing && input.mouseButton().isReleased(sibr::Mouse::Right)) {
+            if (shift && !_strokePoints.empty()) finalizeStroke();
+            _brushing = false;
+        } else if (_brushing && !shift) {
+            _brushing = false;   // Shift let go mid-stroke -> abandon
+        }
     }
 
     void onGUI() override {
@@ -219,6 +256,9 @@ public:
         ImGui::Checkbox("Show Mesh", &_showMesh);
         ImGui::Checkbox("Show Yellow Wireframe", &_wireframeRenderer._showYellowWireframe);
         ImGui::SliderFloat("ExpMap Radius", &_expMapRadius, 0.05f, 5.0f);
+        ImGui::TextDisabled("Shift+RClick: pick one disc  |  Shift+RClick-drag: brush a region");
+        if (_brushing) ImGui::TextColored(ImVec4(1.f, 0.7f, 0.2f, 1.f),
+                                          "Brushing... %d samples", (int)_strokePoints.size());
         ImGui::Separator();
         ImGui::Checkbox("Show Gaussian Outlines", &_showGaussianOutlines);
         ImGui::Separator();
@@ -781,12 +821,77 @@ void main() { fragColor = uColor; }
         if (depthWas)   glEnable(GL_DEPTH_TEST);
     }
 
-    // -------------------------------------------------------------------------
+    // Camera-facing radius ring at every brush sample plus the stroke trail, so
+    // the swept region is visible while dragging. Reuses the flat-colour line
+    // shader from initGaussianOutlineRenderer(). Only drawn mid-stroke.
+    void renderBrushOverlay(const sibr::Camera& eye) {
+        if (!_brushing || _strokePoints.empty() || !_gaussOutlineShader || !_gaussOutlineVAO)
+            return;
+
+        const glm::mat4 mvp = glm::make_mat4(eye.viewproj().data());
+        const sibr::Vector3f eDir = eye.dir(), eUp = eye.up();
+        glm::vec3 fwd(eDir.x(), eDir.y(), eDir.z());
+        glm::vec3 up (eUp.x(),  eUp.y(),  eUp.z());
+        glm::vec3 right = glm::normalize(glm::cross(fwd, up));
+        up = glm::normalize(glm::cross(right, fwd));
+
+        const GLboolean depthWas = glIsEnabled(GL_DEPTH_TEST);
+        const GLboolean blendWas = glIsEnabled(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        glUseProgram(_gaussOutlineShader);
+        glUniformMatrix4fv(glGetUniformLocation(_gaussOutlineShader, "uMVP"),
+                           1, GL_FALSE, glm::value_ptr(mvp));
+        const GLint colorLoc = glGetUniformLocation(_gaussOutlineShader, "uColor");
+        glBindVertexArray(_gaussOutlineVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, _gaussOutlineVBO);
+
+        auto toGlmV = [](const sibr::Vector3f& v) { return glm::vec3(v.x(), v.y(), v.z()); };
+
+        if (_strokePoints.size() >= 2) {
+            std::vector<glm::vec3> trail;
+            trail.reserve(_strokePoints.size());
+            for (const auto& sp : _strokePoints) trail.push_back(toGlmV(sp));
+            glUniform4f(colorLoc, 1.f, 0.55f, 0.1f, 0.95f);
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(trail.size() * sizeof(glm::vec3)),
+                         trail.data(), GL_STREAM_DRAW);
+            glDrawArrays(GL_LINE_STRIP, 0, (GLsizei)trail.size());
+        }
+
+        constexpr int SEGS = 48;
+        std::vector<glm::vec3> ring(SEGS + 1);
+        auto drawRingAt = [&](const glm::vec3& c, float a) {
+            for (int i = 0; i <= SEGS; ++i) {
+                float t = 2.f * 3.14159265358979f * (float)i / SEGS;
+                ring[i] = c + _expMapRadius * (std::cos(t) * right + std::sin(t) * up);
+            }
+            glUniform4f(colorLoc, 1.f, 0.75f, 0.2f, a);
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(ring.size() * sizeof(glm::vec3)),
+                         ring.data(), GL_STREAM_DRAW);
+            glDrawArrays(GL_LINE_STRIP, 0, (GLsizei)ring.size());
+        };
+        for (size_t i = 0; i + 1 < _strokePoints.size(); ++i)
+            drawRingAt(toGlmV(_strokePoints[i]), 0.25f);
+        drawRingAt(toGlmV(_strokePoints.back()), 0.9f);
+
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glUseProgram(0);
+        if (!blendWas) glDisable(GL_BLEND);
+        if (depthWas)  glEnable(GL_DEPTH_TEST);
+    }
 
     // -------------------------------------------------------------------------
 
-    void performRaycast(const sibr::Input& input) {
-        if (!_mesh || !_camHandler) return;
+    // -------------------------------------------------------------------------
+
+    // CPU ray/triangle pick against the mesh at the current cursor. Returns false
+    // if the cursor is off the mesh.
+    bool raycastMesh(const sibr::Input& input, sibr::Vector3f& outPos, int& outTriID) {
+        outTriID = -1;
+        if (!_mesh || !_camHandler) return false;
         const auto& cam = _camHandler->getCamera();
         sibr::Vector2f mp((float)input.mousePosition().x(), (float)input.mousePosition().y());
         float ndcX = (2.f * mp.x()) / _viewport.finalWidth() - 1.f;
@@ -798,7 +903,7 @@ void main() { fragColor = uColor; }
         sibr::Vector3f rayDir(farPt.x()-nearPt.x(), farPt.y()-nearPt.y(), farPt.z()-nearPt.z());
         rayDir.normalize();
 
-        float minDist = 1e9f; int hitTriID = -1; sibr::Vector3f hitPos;
+        float minDist = 1e9f; sibr::Vector3f hitPos;
         const auto& verts = _mesh->vertices();
         const auto& triangles = _mesh->triangles();
         for (size_t t = 0; t < triangles.size(); ++t) {
@@ -808,11 +913,21 @@ void main() { fragColor = uColor; }
             float f = 1.f/a; sibr::Vector3f s = cam.position() - verts[tri[0]];
             float u = f * s.dot(h); if (u < 0.f || u > 1.f) continue;
             sibr::Vector3f q = s.cross(e1); float v = f * rayDir.dot(q); if (v < 0.f || u + v > 1.f) continue;
-            float td = f * e2.dot(q); if (td > 1e-6f && td < minDist) { minDist = td; hitTriID = (int)t; hitPos = cam.position() + rayDir * td; }
+            float td = f * e2.dot(q); if (td > 1e-6f && td < minDist) { minDist = td; outTriID = (int)t; hitPos = cam.position() + rayDir * td; }
         }
-        if (hitTriID < 0) return;
+        if (outTriID < 0) return false;
+        outPos = hitPos;
+        return true;
+    }
 
-        _expMapSolver.OnRaycastHit(hitPos, _expMapRadius, hitTriID);
+    // Turn the accumulated brush stroke (_strokePoints / _strokeTriIDs) into one
+    // staged patch. A 1-point stroke reproduces the old single-click pick exactly.
+    void finalizeStroke() {
+        if (!_mesh || !_camHandler || _strokePoints.empty()) return;
+        const auto& verts = _mesh->vertices();
+        const auto& triangles = _mesh->triangles();
+
+        _expMapSolver.OnBrushStroke(_strokePoints, _strokeTriIDs, _expMapRadius);
         _texPtr = _expMapSolver.GetTextureLoader().getTexture();
         // Do NOT early-return on null texture: UV result window still needs Gaussian projection.
 
@@ -887,7 +1002,19 @@ void main() { fragColor = uColor; }
         const bool canUseAllFids = (int)_allFids.size() == nGauss;
 
         const float r2 = _expMapRadius * _expMapRadius;
-        const glm::vec3 ctr(hitPos.x(), hitPos.y(), hitPos.z());
+        // Broad-phase: a Gaussian is a candidate if it lies within the brush
+        // radius of any stroke sample (the swept capsule). A 1-point stroke makes
+        // this the exact sphere test the single-click pick used.
+        auto nearStroke = [&](const glm::vec3& p) {
+            for (const auto& sp : _strokePoints) {
+                glm::vec3 d = p - glm::vec3(sp.x(), sp.y(), sp.z());
+                if (glm::dot(d, d) <= r2) return true;
+            }
+            return false;
+        };
+        glm::vec3 ctr(0.f);
+        for (const auto& sp : _strokePoints) ctr += glm::vec3(sp.x(), sp.y(), sp.z());
+        if (!_strokePoints.empty()) ctr /= (float)_strokePoints.size();
         std::vector<sibr::Vector2f> all_uvs(nGauss, sibr::Vector2f(-1.f, -1.f));
         std::vector<sibr::Vector3f> all_dUs(nGauss, sibr::Vector3f(0.f, 0.f, 0.f));
         std::vector<sibr::Vector3f> all_dVs(nGauss, sibr::Vector3f(0.f, 0.f, 0.f));
@@ -967,7 +1094,7 @@ void main() { fragColor = uColor; }
 
         for (int k = 0; k < nGauss; ++k) {
             glm::vec3 p(cpuPos[k].x(), cpuPos[k].y(), cpuPos[k].z());
-            if (glm::dot(p - ctr, p - ctr) > r2) continue;
+            if (!nearStroke(p)) continue;
             ++nInSphere;
             {
                 int fdbg = (k < (int)_sortedFids.size()) ? _sortedFids[k] : -1;
@@ -1186,7 +1313,7 @@ void main() { fragColor = uColor; }
         if (_texPtr)
             _gaussianView->setUVsAndTexture(all_uvs, all_dUs, all_dVs, all_surfDists, _lastAllOrigPos, _previewTexIdx);
         // record hit position for toggle reuse
-        _lastHitPos    = sibr::Vector3f(hitPos.x(), hitPos.y(), hitPos.z());
+        _lastHitPos    = sibr::Vector3f(ctr.x, ctr.y, ctr.z);
         _lastExpRadius = _expMapRadius;
         // suppress non-UV gaussians inside texture region to prevent occlusion
         // _gaussianView->suppressGaussiansInRegion(
@@ -1247,6 +1374,17 @@ void main() { fragColor = uColor; }
     GLuint                          _normalMapGLTex = 0;
     sibr::Vector3f                  _lastHitPos   = sibr::Vector3f(0,0,0);
     float                           _lastExpRadius = 0.5f;
+
+    // Brush selection. Shift + right-drag lays down a polyline of surface sample
+    // points; on release finalizeStroke() unwraps the whole swept region as one
+    // patch. A quick Shift + right-click is just a 1-point stroke == the old
+    // single-circle pick. Kept distinct from camera control: the default FPS
+    // camera already ignores mouse pan while Shift is held, and TrackBall was
+    // given the same guard.
+    bool                            _brushing        = false;
+    std::vector<sibr::Vector3f>     _strokePoints;
+    std::vector<int>                _strokeTriIDs;
+    sibr::Vector2f                  _lastSampleMouse = sibr::Vector2f(-1.f, -1.f);
 
     // 360° orbit recording
     bool             _recording360      = false;

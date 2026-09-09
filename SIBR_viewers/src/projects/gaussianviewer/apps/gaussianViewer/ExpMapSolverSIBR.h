@@ -323,6 +323,7 @@ public:
         _validTriangles.clear();
         _validTriIDs.clear();
         _validTriangleIndicesSet.clear();
+        _strokePoints.clear();
         ++_activeGeneration;  // invalidates renderer-side caches of this set
         _displayUVs.clear();
         _vertexData.clear();
@@ -349,21 +350,58 @@ public:
         _cachedGaussianCoverage = 0.f;
     }
     
+    // Average of a triangle's three vertex normals, normalized. Falls back to +Y
+    // for an out-of-range face id.
+    sibr::Vector3f faceAvgNormal(int triID) const {
+        sibr::Vector3f n(0, 1, 0);
+        if (_mesh && triID >= 0 && triID < (int)_mesh->triangles().size()) {
+            const auto& tri = _mesh->triangles()[triID];
+            n = (_mesh->normals()[tri[0]] + _mesh->normals()[tri[1]] + _mesh->normals()[tri[2]]) / 3.0f;
+            n.normalize();
+        }
+        return n;
+    }
+
     void OnRaycastHit(const sibr::Vector3f& hitPos, float radius, int hitTriID) {
         if (!_mesh) return;
-        
-        sibr::Vector3f hitNormal(0, 1, 0);
-        if (hitTriID >= 0 && hitTriID < _mesh->triangles().size()) {
-            const auto& tri = _mesh->triangles()[hitTriID];
-            const auto& n0 = _mesh->normals()[tri[0]];
-            const auto& n1 = _mesh->normals()[tri[1]];
-            const auto& n2 = _mesh->normals()[tri[2]];
-            hitNormal = (n0 + n1 + n2) / 3.0f;
-            hitNormal.normalize();
-        }
-        
-        Compute(hitPos, hitNormal, radius, hitTriID);
+        Compute(hitPos, faceAvgNormal(hitTriID), radius, hitTriID);
     }
+
+    // Brush selection: a polyline of surface sample points. The frozen region is
+    // every vertex within |radius| of the polyline (a swept "capsule"), unwrapped
+    // from a single seed frame anchored at the first sample so the UV chart stays
+    // continuous. A one-point stroke is identical to OnRaycastHit.
+    void OnBrushStroke(const std::vector<sibr::Vector3f>& pts,
+                       const std::vector<int>& triIDs, float radius) {
+        if (!_mesh || pts.empty()) return;
+        std::vector<glm::vec3>      gp(pts.size());
+        std::vector<sibr::Vector3f> nrm(pts.size());
+        for (size_t i = 0; i < pts.size(); ++i) {
+            gp[i]  = toGlm(pts[i]);
+            nrm[i] = faceAvgNormal(i < triIDs.size() ? triIDs[i] : -1);
+        }
+        Compute(gp, nrm, triIDs.empty() ? -1 : triIDs[0], radius);
+    }
+
+    // Shortest distance from |p| to the brush polyline (segments between
+    // consecutive stroke samples). Degrades to point distance for a 1-point
+    // stroke, and is what Compute() uses as its freeze cutoff.
+    float distToStroke(const glm::vec3& p) const {
+        if (_strokePoints.empty()) return 1e9f;
+        if (_strokePoints.size() == 1) return glm::distance(p, _strokePoints[0]);
+        float best = 1e9f;
+        for (size_t i = 0; i + 1 < _strokePoints.size(); ++i) {
+            const glm::vec3& a = _strokePoints[i];
+            const glm::vec3& b = _strokePoints[i + 1];
+            glm::vec3 ab = b - a;
+            float len2 = glm::dot(ab, ab);
+            float t = (len2 > 1e-12f) ? glm::clamp(glm::dot(p - a, ab) / len2, 0.f, 1.f) : 0.f;
+            best = std::min(best, glm::distance(p, a + t * ab));
+        }
+        return best;
+    }
+
+    const std::vector<glm::vec3>& GetStrokePoints() const { return _strokePoints; }
 
     void Init(const sibr::Mesh* mesh) {
         _mesh = mesh;
@@ -400,7 +438,18 @@ public:
     }
 
     void Compute(const sibr::Vector3f& hitPos, const sibr::Vector3f& hitNormal, float radius, int hitTriID = -1) {
-        if(!_mesh) return;
+        Compute(std::vector<glm::vec3>{ toGlm(hitPos) },
+                std::vector<sibr::Vector3f>{ hitNormal }, hitTriID, radius);
+    }
+
+    void Compute(const std::vector<glm::vec3>& strokePts,
+                 const std::vector<sibr::Vector3f>& strokeNormals,
+                 int seedTriID, float radius) {
+        if(!_mesh || strokePts.empty() || strokeNormals.empty()) return;
+
+        _strokePoints = strokePts;
+        const sibr::Vector3f hitNormal = strokeNormals[0];
+        const int hitTriID = seedTriID;
 
         _vertexData.clear();
         _displayUVs.clear();
@@ -421,7 +470,7 @@ public:
         
         _adj = _baseAdj;
 
-        glm::vec3 target = toGlm(hitPos);
+        glm::vec3 target = strokePts[0];
 
         auto comp = [&](int a, int b){ return _vertexData[a].cost > _vertexData[b].cost; };
         std::priority_queue<int, std::vector<int>, decltype(comp)> pq(comp);
@@ -456,7 +505,10 @@ public:
             if(_vertexData[currIdx].frozen) continue;
             _vertexData[currIdx].frozen = true;
 
-            if(_vertexData[currIdx].cost > radius) continue;
+            // Freeze cutoff: within the brush radius of the stroke polyline (a
+            // swept capsule), not the geodesic distance from a single seed. For a
+            // 1-point stroke distToStroke() is exactly the old radius test.
+            if(distToStroke(getPos(currIdx)) > radius) continue;
             glm::vec3 currN = glm::normalize(getNormal(currIdx));
             if (glm::dot(currN, toGlm(hitNormal)) < 0.0f) continue;
 
@@ -1545,6 +1597,7 @@ private:
     std::vector<std::vector<int>> _vertexToTriangles;
     std::map<int, ExpVertex>      _vertexData;
     TangentFrame                  _seedFrame;
+    std::vector<glm::vec3>        _strokePoints;   // brush polyline; 1 entry == single click
 
     std::vector<sibr::Vector3u>   _validTriangles;
     std::vector<int>              _validTriIDs;
